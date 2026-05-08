@@ -1,0 +1,9 @@
+pandas
+scikit-learn
+xgboost
+optuna
+shap
+joblib
+psycopg2-binary
+sshtunnel
+python-dotenv
