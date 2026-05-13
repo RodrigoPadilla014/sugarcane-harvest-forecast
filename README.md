@@ -1,6 +1,10 @@
 # TCH Prediction Harvest Season
 
-Pipeline to predict TCH by lot/harvest season and support harvest-season production estimates from SQL-aggregated datasets.
+This project builds a machine learning workflow for estimating sugarcane yield at the lot and harvest-season level.
+
+The main prediction target is TCH, or tons of cane per hectare. Once TCH is predicted for each lot, those predictions can be combined with lot area to estimate total production for a harvest season. The workflow is designed around SQL-aggregated datasets so each training row represents one lot-season, making the modeling data easier to inspect, validate, and explain.
+
+In practical terms, the pipeline turns field, satellite, weather, climate, and radar signals into a clean feature table, trains models in SageMaker, and writes diagnostics that help decide which features should be kept, removed, or redesigned in the next iteration.
 
 ## Current Workflow
 
