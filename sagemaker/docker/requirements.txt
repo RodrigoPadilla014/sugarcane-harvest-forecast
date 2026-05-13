@@ -1,0 +1,13 @@
+pandas==2.2.3
+pyarrow==18.1.0
+numpy==1.26.4
+scipy==1.11.4
+scikit-learn==1.5.2
+xgboost==1.7.6
+lightgbm==4.5.0
+catboost==1.2.7
+optuna==3.6.1
+shap==0.46.0
+numba==0.60.0
+llvmlite==0.43.0
+joblib==1.4.2

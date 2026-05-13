@@ -1,6 +1,10 @@
 # Credentials
 credentials/
 
+# Local scratch
+.tmp/
+.claude/
+
 # Python
 __pycache__/
 *.pyc
