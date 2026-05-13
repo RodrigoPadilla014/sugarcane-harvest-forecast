@@ -1,18 +1,18 @@
 # TCH Prediction Harvest Season
 
-Pipeline para predecir TCH por lote/zafra y estimar produccion total por zafra a partir de datasets agregados en SQL.
+Pipeline to predict TCH by lot/harvest season and support harvest-season production estimates from SQL-aggregated datasets.
 
-## Estado Actual
+## Current Workflow
 
-El flujo principal usa un dataset preagregado:
+The main workflow uses a pre-aggregated feature table:
 
 ```text
 queries/aggregated/tch_aggregated_features_v1.sql
 ```
 
-Este SQL genera una fila por `cod_cg_zafra` desde `tch_raw_longitudinal`, conservando la logica de ciclos ya calculada en la vista cruda.
+This SQL creates one row per `cod_cg_zafra` from `tch_raw_longitudinal`, preserving the cycle logic already computed in the raw longitudinal view.
 
-Contrato minimo del dataset:
+Minimum dataset contract:
 
 ```text
 cod_cg_zafra
@@ -25,34 +25,33 @@ fecha_inicio_ciclo
 fecha_fin_ciclo
 ```
 
-`tch` es el target plano. `area` y `tc` se conservan para metadata/reporting y para estimar produccion posterior, no para transformar el target.
+`tch` is the plain target. `area` and `tc` are retained for metadata, reporting, and downstream production estimates; they are not used to transform the target.
 
-## Dataset En S3
+## Dataset In S3
 
-Dataset validado:
+Expected dataset location:
 
 ```text
 s3://<bucket>/datasets/tch_aggregated_features_v1.parquet
 ```
 
-Validacion al momento de crearlo:
+Expected validation checks after dataset creation:
 
 ```text
-filas: 43,630
-cod_cg_zafra distintos: 43,630
-duplicados: 0
-nulos en tch/zafra_norm/area: 0
+one row per cod_cg_zafra
+no duplicate cod_cg_zafra rows
+no nulls in tch/zafra_norm/area
 ```
 
-## Imagen De Entrenamiento
+## Training Image
 
-La imagen custom de SageMaker esta en ECR:
+The custom SageMaker image is stored in ECR:
 
 ```text
 <account-id>.dkr.ecr.<region>.amazonaws.com/tch-sagemaker-training:latest
 ```
 
-El digest exacto de la imagen debe obtenerse desde ECR cuando se necesite auditar una corrida:
+Get the exact image digest from ECR when a run needs to be audited:
 
 ```powershell
 aws ecr describe-images `
@@ -62,7 +61,7 @@ aws ecr describe-images `
   --output text
 ```
 
-Si cambia algo en `sagemaker/training/`, reconstruir y subir:
+If anything changes under `sagemaker/training/`, rebuild and push the image:
 
 ```powershell
 $ACCOUNT_ID = aws sts get-caller-identity --query Account --output text
@@ -74,9 +73,9 @@ aws ecr get-login-password --region $REGION | docker login --username AWS --pass
 docker push "$REPO:latest"
 ```
 
-## Subir Dataset
+## Upload A Dataset
 
-`upload_dataset.py` busca SQL en:
+`upload_dataset.py` looks for SQL files in:
 
 ```text
 queries/datasets/
@@ -84,21 +83,21 @@ queries/aggregated/
 queries/
 ```
 
-Para regenerar y subir el dataset:
+Regenerate and upload the aggregated dataset:
 
 ```powershell
 python sagemaker/jobs/upload_dataset.py tch_aggregated_features_v1
 ```
 
-## Lanzar Entrenamiento
+## Launch Training
 
-El dataset agregado debe lanzarse con:
+Aggregated feature-table datasets must be launched with:
 
 ```text
 --dataset-type feature_table
 ```
 
-Ejemplo completo con LightGBM, Optuna, SHAP y diagnosticos:
+Full LightGBM example with Optuna, SHAP, and feature diagnostics:
 
 ```powershell
 python sagemaker/jobs/launch_job.py tch_aggregated_features_v1 `
@@ -108,7 +107,7 @@ python sagemaker/jobs/launch_job.py tch_aggregated_features_v1 `
   --image-uri <account-id>.dkr.ecr.<region>.amazonaws.com/tch-sagemaker-training:latest
 ```
 
-Para una corrida rapida sin SHAP:
+Fast run without SHAP:
 
 ```powershell
 python sagemaker/jobs/launch_job.py tch_aggregated_features_v1 `
@@ -121,26 +120,20 @@ python sagemaker/jobs/launch_job.py tch_aggregated_features_v1 `
 
 ## Artifacts
 
-Los resultados quedan en:
+Training outputs are written to:
 
 ```text
 s3://<bucket>/experiments/{dataset}/{model_type}/{job_name}/
 ```
 
-El job completo validado fue:
-
-```text
-tch-tch-aggregated-features-v1-lightgbm-20260513-124334
-```
-
-Outputs principales:
+Main SageMaker outputs:
 
 ```text
 output/model.tar.gz
 output/output.tar.gz
 ```
 
-Dentro de `output.tar.gz`:
+Expected files inside `output.tar.gz`:
 
 ```text
 metrics.json
@@ -156,31 +149,15 @@ feature_pruning_recommendations.csv
 best_params.json
 ```
 
-## Resultado Validado
+## Modeling Notes
 
-Job:
-
-```text
-tch-tch-aggregated-features-v1-lightgbm-20260513-124334
-```
-
-Metricas:
-
-```text
-train       R2=0.681  RMSE=14.65  MAE=10.66
-validation  R2=0.360  RMSE=20.22  MAE=14.83  bias=-4.13
-test        R2=0.303  RMSE=21.26  MAE=15.54  bias=-7.88
-```
-
-## Notas De Modelado
-
-El pipeline funciona end-to-end. El siguiente trabajo es mejorar el feature set:
+The end-to-end workflow is designed to generate the evidence needed for feature pruning:
 
 ```text
 SHAP importance
-correlacion entre features
+feature correlation
 missing rate
-estabilidad train vs validation/test
+train vs validation/test stability
 ```
 
-El overfit observado sugiere crear una version compacta del dataset o aplicar poda de features basada en los diagnostics.
+Use those diagnostics to decide whether to create a compact `v2` feature table or to exclude feature families in the training workflow.
