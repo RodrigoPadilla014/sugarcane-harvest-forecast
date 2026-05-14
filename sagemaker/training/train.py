@@ -94,8 +94,11 @@ def fit_with_optuna(
         pred = model.predict(X_validation)
         return regression_metrics(y_validation, pred)["rmse"]
 
+    def trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
+        log(f"Trial {trial.number + 1}/{n_trials} | rmse={trial.value:.4f} | best={study.best_value:.4f}")
+
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=n_trials)
+    study.optimize(objective, n_trials=n_trials, callbacks=[trial_callback])
     return study.best_params, study
 
 

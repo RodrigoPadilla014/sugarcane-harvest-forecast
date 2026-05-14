@@ -2,22 +2,18 @@
 Submit a SageMaker training job.
 
 Usage:
-    python launch_job.py ml_dataset
-    python launch_job.py ml_dataset --model-type random_forest --n-trials 30
+    python launch_job.py ml_dataset --image-uri <account>.dkr.ecr.<region>.amazonaws.com/tch-sagemaker-training:latest
+    python launch_job.py ml_dataset --model-type random_forest --n-trials 30 --image-uri <image>
 """
 import argparse
 from datetime import datetime
-from pathlib import Path
 
 import boto3
 import sagemaker
 from sagemaker.inputs import TrainingInput
 from sagemaker.estimator import Estimator
-from sagemaker.sklearn import SKLearn
 
-from config import BUCKET, FRAMEWORK_VERSION, INSTANCE_TYPE, PYTHON_VERSION, REGION, ROLE_ARN
-
-TRAINING_DIR = Path(__file__).resolve().parents[1] / "training"
+from config import BUCKET, INSTANCE_TYPE, REGION, ROLE_ARN
 
 
 def launch(
@@ -33,6 +29,9 @@ def launch(
     diagnostics: bool = True,
     image_uri: str = None,
 ) -> str:
+    if not image_uri:
+        raise ValueError("image_uri is required. Build and push the custom training image, then pass --image-uri.")
+
     session = sagemaker.Session(boto_session=boto3.Session(region_name=REGION))
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -55,37 +54,19 @@ def launch(
     ]
     output_path = f"s3://{BUCKET}/experiments/{dataset}/{model_type}/"
 
-    if image_uri:
-        estimator = Estimator(
-            image_uri=image_uri,
-            role=ROLE_ARN,
-            instance_type=INSTANCE_TYPE,
-            instance_count=1,
-            sagemaker_session=session,
-            use_spot_instances=True,
-            max_wait=7200,
-            max_run=3600,
-            hyperparameters=hyperparameters,
-            metric_definitions=metric_definitions,
-            output_path=output_path,
-        )
-    else:
-        estimator = SKLearn(
-            entry_point="train.py",
-            source_dir=str(TRAINING_DIR),
-            role=ROLE_ARN,
-            instance_type=INSTANCE_TYPE,
-            instance_count=1,
-            framework_version=FRAMEWORK_VERSION,
-            py_version=PYTHON_VERSION,
-            sagemaker_session=session,
-            use_spot_instances=True,
-            max_wait=7200,
-            max_run=3600,
-            hyperparameters=hyperparameters,
-            metric_definitions=metric_definitions,
-            output_path=output_path,
-        )
+    estimator = Estimator(
+        image_uri=image_uri,
+        role=ROLE_ARN,
+        instance_type=INSTANCE_TYPE,
+        instance_count=1,
+        sagemaker_session=session,
+        use_spot_instances=True,
+        max_wait=7200,
+        max_run=7200,
+        hyperparameters=hyperparameters,
+        metric_definitions=metric_definitions,
+        output_path=output_path,
+    )
 
     dataset_s3_uri = f"s3://{BUCKET}/datasets/{dataset}/" if partitioned else f"s3://{BUCKET}/datasets/{dataset}.parquet"
 
@@ -112,7 +93,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-light-features", action="store_true", help="Disable light pandas-derived features for feature-table datasets")
     parser.add_argument("--no-shap", action="store_true", help="Skip SHAP generation for faster baseline runs")
     parser.add_argument("--no-diagnostics", action="store_true", help="Skip feature diagnostics artifacts")
-    parser.add_argument("--image-uri", default=None, help="Custom SageMaker training image URI")
+    parser.add_argument("--image-uri", required=True, help="Custom SageMaker training image URI")
     args = parser.parse_args()
     launch(
         args.dataset,

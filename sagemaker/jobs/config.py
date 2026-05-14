@@ -8,5 +8,3 @@ BUCKET = "ndvi-extraction"
 REGION = "us-east-1"
 ROLE_ARN = os.environ["SAGEMAKER_ROLE_ARN"]
 INSTANCE_TYPE = "ml.m5.xlarge"
-FRAMEWORK_VERSION = "1.2-1"
-PYTHON_VERSION = "py3"
