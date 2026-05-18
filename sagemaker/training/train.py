@@ -10,19 +10,38 @@ import json
 import os
 
 import joblib
+import numpy as np
 import optuna
 import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import make_pipeline
 
+from categorical_encoding import (
+    CATEGORICAL_MODE_NATIVE,
+    CATEGORICAL_MODES,
+    categorical_feature_columns,
+    fit_transform_categorical_features,
+    resolve_categorical_mode,
+    save_categorical_encoding_state,
+    validate_categorical_mode_for_model,
+)
 from feature_diagnostics import save_feature_diagnostics
 from features import build_dataset
-from metrics import regression_metrics, zafra_metrics
+from metrics import (
+    lot_error_metrics,
+    lot_predictions,
+    quantile_interval_metrics,
+    regression_metrics,
+    tch_range_metrics,
+    zafra_metrics,
+)
 from models import build_model, suggest_params
 from shap_utils import save_shap_values
 from splits import temporal_split, walk_forward_splits
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+QUANTILE_ALPHAS = (0.10, 0.50, 0.90)
 
 
 def log(message: str) -> None:
@@ -79,25 +98,185 @@ def build_estimator(model_type: str, params: dict):
     return model
 
 
+def prepare_features_for_model(
+    X: pd.DataFrame,
+    model_type: str,
+    categorical_mode: str,
+) -> pd.DataFrame:
+    if categorical_mode == CATEGORICAL_MODE_NATIVE:
+        validate_categorical_mode_for_model(categorical_mode, model_type)
+        return X.copy()
+    return X.apply(pd.to_numeric, errors="coerce")
+
+
+def fit_model(model, model_type: str, X: pd.DataFrame, y: pd.Series, categorical_mode: str):
+    if model_type == "catboost" and categorical_mode == CATEGORICAL_MODE_NATIVE:
+        cat_cols = categorical_feature_columns(X)
+        model.fit(X, y, cat_features=cat_cols)
+    else:
+        model.fit(X, y)
+    return model
+
+
+def build_quantile_estimator(model_type: str, params: dict, alpha: float):
+    if model_type == "lightgbm":
+        quantile_params = dict(params)
+        quantile_params.update(
+            {
+                "objective": "quantile",
+                "alpha": alpha,
+            }
+        )
+        return build_estimator(model_type, quantile_params)
+
+    if model_type == "catboost":
+        quantile_params = dict(params)
+        quantile_params["loss_function"] = f"Quantile:alpha={alpha}"
+        return build_estimator(model_type, quantile_params)
+
+    return make_pipeline(
+        SimpleImputer(strategy="median", keep_empty_features=True),
+        GradientBoostingRegressor(
+            loss="quantile",
+            alpha=alpha,
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=42,
+        ),
+    )
+
+
+def fit_quantile_models(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    model_type: str,
+    params: dict,
+    categorical_mode: str,
+    quantile_alphas=QUANTILE_ALPHAS,
+):
+    if model_type == "random_forest":
+        return {}
+
+    models = {}
+    for alpha in quantile_alphas:
+        model = build_quantile_estimator(model_type, params, alpha)
+        fit_model(model, model_type, X_train, y_train, categorical_mode)
+        models[alpha] = model
+    return models
+
+
+def random_forest_quantile_predictions(model, X: pd.DataFrame, alpha: float) -> np.ndarray:
+    forest = model
+    forest_X = X
+    if hasattr(model, "named_steps"):
+        imputer = model.named_steps["simpleimputer"]
+        forest = model.named_steps["randomforestregressor"]
+        forest_X = imputer.transform(X)
+
+    tree_predictions = np.column_stack([tree.predict(forest_X) for tree in forest.estimators_])
+    return np.quantile(tree_predictions, alpha, axis=1)
+
+
+def predict_quantiles(
+    base_model,
+    model_type: str,
+    quantile_models: dict,
+    X: pd.DataFrame,
+    y: pd.Series,
+    metadata: pd.DataFrame,
+    split: str,
+) -> pd.DataFrame:
+    df = metadata.set_index("cod_cg_zafra").loc[y.index].copy()
+    df.index.name = "cod_cg_zafra"
+    df = df.reset_index()
+    df["split"] = split
+    df["actual_tch"] = y.to_numpy()
+    for alpha in QUANTILE_ALPHAS:
+        percentile = int(round(alpha * 100))
+        if model_type == "random_forest":
+            df[f"pred_tch_p{percentile}"] = random_forest_quantile_predictions(base_model, X, alpha)
+        else:
+            df[f"pred_tch_p{percentile}"] = quantile_models[alpha].predict(X)
+
+    ordered_cols = [
+        "split",
+        "cod_cg_zafra",
+        "cod_cg",
+        "zafra_norm",
+        "area",
+        "actual_tch",
+        "pred_tch_p10",
+        "pred_tch_p50",
+        "pred_tch_p90",
+    ]
+    return df[[col for col in ordered_cols if col in df.columns]]
+
+
 def fit_with_optuna(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     X_validation: pd.DataFrame,
     y_validation: pd.Series,
+    X: pd.DataFrame,
+    y: pd.Series,
+    metadata: pd.DataFrame,
     model_type: str,
     n_trials: int,
+    walk_forward: bool,
+    stability_penalty: float,
+    categorical_mode: str,
 ):
+    walk_forward_folds = walk_forward_splits(metadata) if walk_forward else []
+
     def objective(trial):
         params = suggest_params(trial, model_type)
+
+        if walk_forward:
+            fold_scores = []
+            fold_rmses = []
+            for validation_zafra, train_idx, validation_idx in walk_forward_folds:
+                train_idx = train_idx.intersection(X.index)
+                validation_idx = validation_idx.intersection(X.index)
+                if train_idx.empty or validation_idx.empty:
+                    continue
+
+                model = build_estimator(model_type, params)
+                fit_model(model, model_type, X.loc[train_idx], y.loc[train_idx], categorical_mode)
+                pred = model.predict(X.loc[validation_idx])
+                fold_metrics = regression_metrics(y.loc[validation_idx], pred)
+                fold_scores.append(fold_metrics["r2"])
+                fold_rmses.append(fold_metrics["rmse"])
+
+            if not fold_scores:
+                raise ValueError("Walk-forward objective produced no valid folds")
+
+            mean_r2 = float(np.mean(fold_scores))
+            std_r2 = float(np.std(fold_scores))
+            trial.set_user_attr("fold_r2", fold_scores)
+            trial.set_user_attr("fold_rmse", fold_rmses)
+            trial.set_user_attr("mean_r2", mean_r2)
+            trial.set_user_attr("std_r2", std_r2)
+            return mean_r2 - stability_penalty * std_r2
+
         model = build_estimator(model_type, params)
-        model.fit(X_train, y_train)
+        fit_model(model, model_type, X_train, y_train, categorical_mode)
         pred = model.predict(X_validation)
         return regression_metrics(y_validation, pred)["rmse"]
 
     def trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        log(f"Trial {trial.number + 1}/{n_trials} | rmse={trial.value:.4f} | best={study.best_value:.4f}")
+        if walk_forward:
+            mean_r2 = trial.user_attrs.get("mean_r2")
+            std_r2 = trial.user_attrs.get("std_r2")
+            log(
+                f"Trial {trial.number + 1}/{n_trials} | "
+                f"wf_score={trial.value:.4f} | mean_r2={mean_r2:.4f} | "
+                f"std_r2={std_r2:.4f} | best={study.best_value:.4f}"
+            )
+        else:
+            log(f"Trial {trial.number + 1}/{n_trials} | rmse={trial.value:.4f} | best={study.best_value:.4f}")
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="maximize" if walk_forward else "minimize")
     study.optimize(objective, n_trials=n_trials, callbacks=[trial_callback])
     return study.best_params, study
 
@@ -106,7 +285,8 @@ def evaluate_split(model, X: pd.DataFrame, y: pd.Series, metadata: pd.DataFrame,
     pred = model.predict(X)
     metrics = regression_metrics(y, pred)
     zafra_df = zafra_metrics(metadata, y, pred, split=split)
-    return metrics, zafra_df
+    lot_df = lot_predictions(metadata, y, pred, split=split)
+    return metrics, zafra_df, lot_df
 
 
 def run_walk_forward(
@@ -115,6 +295,7 @@ def run_walk_forward(
     metadata: pd.DataFrame,
     model_type: str,
     params: dict,
+    categorical_mode: str,
 ) -> pd.DataFrame:
     rows = []
     for validation_zafra, train_idx, validation_idx in walk_forward_splits(metadata):
@@ -124,7 +305,7 @@ def run_walk_forward(
             continue
 
         model = build_estimator(model_type, params)
-        model.fit(X.loc[train_idx], y.loc[train_idx])
+        fit_model(model, model_type, X.loc[train_idx], y.loc[train_idx], categorical_mode)
         pred = model.predict(X.loc[validation_idx])
         fold_metrics = regression_metrics(y.loc[validation_idx], pred)
         fold_metrics["validation_zafra"] = validation_zafra
@@ -147,7 +328,16 @@ def main():
     parser.add_argument("--target", type=str, default=hyperparameter(hp_defaults, "target", "tch"))
     parser.add_argument("--n-trials", type=int, default=hyperparameter(hp_defaults, "n-trials", 50, int))
     parser.add_argument("--walk-forward", type=parse_bool, default=hyperparameter(hp_defaults, "walk-forward", False, parse_bool))
+    parser.add_argument("--walk-forward-stability-penalty", type=float, default=hyperparameter(hp_defaults, "walk-forward-stability-penalty", 0.25, float))
     parser.add_argument("--light-features", type=parse_bool, default=hyperparameter(hp_defaults, "light-features", True, parse_bool))
+    parser.add_argument("--one-hot-features", type=parse_bool, default=hyperparameter(hp_defaults, "one-hot-features", True, parse_bool))
+    parser.add_argument(
+        "--categorical-mode",
+        type=str,
+        default=hyperparameter(hp_defaults, "categorical-mode", None),
+        choices=sorted(CATEGORICAL_MODES),
+    )
+    parser.add_argument("--quantiles", type=parse_bool, default=hyperparameter(hp_defaults, "quantiles", True, parse_bool))
     parser.add_argument("--shap", type=parse_bool, default=hyperparameter(hp_defaults, "shap", True, parse_bool))
     parser.add_argument("--diagnostics", type=parse_bool, default=hyperparameter(hp_defaults, "diagnostics", True, parse_bool))
     args, unknown_args = parser.parse_known_args()
@@ -163,15 +353,18 @@ def main():
     input_df = load_parquet_dir(data_dir)
     log(f"Loaded input dataframe: rows={len(input_df):,}, columns={len(input_df.columns):,}")
 
-    log(f"Building {args.dataset_type} feature matrix")
+    categorical_mode = resolve_categorical_mode(args.categorical_mode, args.one_hot_features)
+    validate_categorical_mode_for_model(categorical_mode, args.model_type)
+    log(f"Categorical mode: {categorical_mode}")
+
+    log(f"Building {args.dataset_type} raw feature matrix")
     X, y, metadata = build_dataset(
         input_df,
         dataset_type=args.dataset_type,
         target=args.target,
         light_features=args.light_features,
     )
-    X = X.apply(pd.to_numeric, errors="coerce")
-    log(f"Built feature matrix: rows={len(X):,}, features={X.shape[1]:,}")
+    log(f"Built raw feature matrix: rows={len(X):,}, features={X.shape[1]:,}")
 
     log("Creating temporal split")
     train_idx, validation_idx, test_idx = temporal_split(metadata)
@@ -185,6 +378,17 @@ def main():
             f"train={len(train_idx)}, validation={len(validation_idx)}, test={len(test_idx)}"
         )
 
+    log("Encoding categorical features after temporal split")
+    X, categorical_encoding_state = fit_transform_categorical_features(
+        X,
+        train_idx=train_idx,
+        mode=categorical_mode,
+    )
+    X = prepare_features_for_model(X, args.model_type, categorical_mode)
+    log(f"Built encoded feature matrix: rows={len(X):,}, features={X.shape[1]:,}")
+    if categorical_mode == CATEGORICAL_MODE_NATIVE:
+        log(f"Using native categorical columns: {categorical_feature_columns(X)}")
+
     X_train, y_train = X.loc[train_idx], y.loc[train_idx]
     X_validation, y_validation = X.loc[validation_idx], y.loc[validation_idx]
     X_test, y_test = X.loc[test_idx], y.loc[test_idx]
@@ -197,33 +401,72 @@ def main():
 
     if args.diagnostics:
         log("Saving feature diagnostics")
-        save_feature_diagnostics(X, train_idx, validation_idx, test_idx, output_dir)
+        save_feature_diagnostics(X, y, train_idx, validation_idx, test_idx, output_dir)
     else:
         log("Skipping feature diagnostics")
 
-    log(f"Starting Optuna: model_type={args.model_type}, n_trials={args.n_trials}")
+    if args.walk_forward:
+        log(
+            "Starting Optuna with walk-forward objective: "
+            f"model_type={args.model_type}, n_trials={args.n_trials}, "
+            f"score=mean_r2-{args.walk_forward_stability_penalty}*std_r2"
+        )
+    else:
+        log(f"Starting Optuna: model_type={args.model_type}, n_trials={args.n_trials}, score=validation_rmse")
     best_params, study = fit_with_optuna(
         X_train,
         y_train,
         X_validation,
         y_validation,
+        X,
+        y,
+        metadata,
         model_type=args.model_type,
         n_trials=args.n_trials,
+        walk_forward=args.walk_forward,
+        stability_penalty=args.walk_forward_stability_penalty,
+        categorical_mode=categorical_mode,
     )
     log(f"Best params: {best_params}")
 
     log("Training final model on train split")
     model = build_estimator(args.model_type, best_params)
-    model.fit(X_train, y_train)
+    fit_model(model, args.model_type, X_train, y_train, categorical_mode)
+
+    quantile_models = {}
+    quantiles_enabled = bool(args.quantiles)
+    if quantiles_enabled:
+        if args.model_type == "random_forest":
+            log("Using random forest tree-distribution quantiles: p10, p50, p90")
+        elif args.model_type in {"lightgbm", "catboost"}:
+            log(f"Training {args.model_type} native quantile models: p10, p50, p90")
+            quantile_models = fit_quantile_models(
+                X_train,
+                y_train,
+                args.model_type,
+                best_params,
+                categorical_mode,
+            )
+        else:
+            log(f"Training sklearn quantile auxiliary models for {args.model_type}: p10, p50, p90")
+            quantile_models = fit_quantile_models(
+                X_train,
+                y_train,
+                args.model_type,
+                best_params,
+                categorical_mode,
+            )
 
     metrics_by_split = {}
     zafra_frames = []
+    lot_prediction_frames = []
+    quantile_prediction_frames = []
     for split, split_idx in {
         "train": train_idx,
         "validation": validation_idx,
         "test": test_idx,
     }.items():
-        split_metrics, split_zafra = evaluate_split(
+        split_metrics, split_zafra, split_lot_predictions = evaluate_split(
             model,
             X.loc[split_idx],
             y.loc[split_idx],
@@ -232,13 +475,51 @@ def main():
         )
         metrics_by_split[split] = split_metrics
         zafra_frames.append(split_zafra)
+        lot_prediction_frames.append(split_lot_predictions)
+        if quantiles_enabled:
+            quantile_prediction_frames.append(
+                predict_quantiles(
+                    model,
+                    args.model_type,
+                    quantile_models,
+                    X.loc[split_idx],
+                    y.loc[split_idx],
+                    metadata,
+                    split=split,
+                )
+            )
         log(f"{split} metrics: {split_metrics}")
 
     metrics_by_zafra = pd.concat(zafra_frames, ignore_index=True)
+    predictions_by_lot = pd.concat(lot_prediction_frames, ignore_index=True)
+    metrics_by_lot_error = lot_error_metrics(predictions_by_lot)
+    metrics_by_tch_range = tch_range_metrics(predictions_by_lot)
+    for row in metrics_by_lot_error.to_dict(orient="records"):
+        split = row.pop("split")
+        metrics_by_split.setdefault(split, {}).update(row)
+    log(f"Lot error metrics: {metrics_by_lot_error.to_dict(orient='records')}")
+    log(f"TCH range metrics: {metrics_by_tch_range.to_dict(orient='records')}")
+
+    predictions_by_quantile = pd.DataFrame()
+    metrics_by_quantile_interval = pd.DataFrame()
+    if quantile_prediction_frames:
+        predictions_by_quantile = pd.concat(quantile_prediction_frames, ignore_index=True)
+        metrics_by_quantile_interval = quantile_interval_metrics(predictions_by_quantile)
+        for row in metrics_by_quantile_interval.to_dict(orient="records"):
+            split = row.pop("split")
+            metrics_by_split.setdefault(split, {}).update(row)
+        log(f"Quantile interval metrics: {metrics_by_quantile_interval.to_dict(orient='records')}")
 
     walk_forward_metrics = pd.DataFrame()
     if args.walk_forward:
-        walk_forward_metrics = run_walk_forward(X, y, metadata, args.model_type, best_params)
+        walk_forward_metrics = run_walk_forward(
+            X,
+            y,
+            metadata,
+            args.model_type,
+            best_params,
+            categorical_mode,
+        )
         log(f"Walk-forward metrics: {walk_forward_metrics.to_dict(orient='records')}")
 
     if args.shap:
@@ -249,7 +530,19 @@ def main():
 
     log("Saving artifacts")
     joblib.dump(model, os.path.join(model_dir, "model.joblib"))
+    save_categorical_encoding_state(categorical_encoding_state, output_dir)
+    if quantile_models:
+        joblib.dump(quantile_models, os.path.join(model_dir, "quantile_models.joblib"))
+    predictions_by_lot.to_csv(os.path.join(output_dir, "predictions_by_lot.csv"), index=False)
+    if not predictions_by_quantile.empty:
+        predictions_by_quantile.to_csv(os.path.join(output_dir, "predictions_by_lot_quantiles.csv"), index=False)
+    if not metrics_by_quantile_interval.empty:
+        metrics_by_quantile_interval.to_csv(os.path.join(output_dir, "metrics_by_quantile_interval.csv"), index=False)
+    metrics_by_lot_error.to_csv(os.path.join(output_dir, "metrics_by_lot_error.csv"), index=False)
+    metrics_by_tch_range.to_csv(os.path.join(output_dir, "metrics_by_tch_range.csv"), index=False)
     metrics_by_zafra.to_csv(os.path.join(output_dir, "metrics_by_zafra.csv"), index=False)
+    metrics_by_zafra.to_csv(os.path.join(output_dir, "tch_by_zafra.csv"), index=False)
+    study.trials_dataframe().to_csv(os.path.join(output_dir, "optuna_trials.csv"), index=False)
     if not walk_forward_metrics.empty:
         walk_forward_metrics.to_csv(os.path.join(output_dir, "walk_forward_metrics.csv"), index=False)
 
@@ -269,6 +562,16 @@ def main():
                 "matrix_rows": int(len(X)),
                 "feature_count": int(X.shape[1]),
                 "light_features": bool(args.light_features),
+                "one_hot_features": bool(args.one_hot_features),
+                "categorical_mode": categorical_mode,
+                "categorical_columns": categorical_encoding_state.categorical_cols,
+                "dropped_categorical_columns": categorical_encoding_state.drop_cols,
+                "quantiles": bool(quantiles_enabled),
+                "quantile_alphas": list(QUANTILE_ALPHAS),
+                "walk_forward": bool(args.walk_forward),
+                "walk_forward_stability_penalty": float(args.walk_forward_stability_penalty),
+                "optuna_direction": study.direction.name,
+                "optuna_best_value": float(study.best_value),
                 "shap": bool(args.shap),
                 "diagnostics": bool(args.diagnostics),
                 "train_rows": int(len(train_idx)),

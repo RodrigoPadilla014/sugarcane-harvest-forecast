@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-import re
 
 
 TARGET = "tch"
@@ -43,10 +42,10 @@ STATIC_COLS = [
     "prod_grupo_de_suelo",
     "prod_grupo_de_humedad",
     "prod_codigo_zae",
-    "prod_finca",
     "prod_familia_de_suelo",
     "prod_variedad",
     "prod_no_corte",
+    "prod_cosecha",
 ]
 
 METADATA_STATIC_COLS = ["cod_cg", TIME_COL, "area"]
@@ -205,34 +204,6 @@ def _log(message: str) -> None:
     print(message, flush=True)
 
 
-def _sanitize_feature_name(name: object) -> str:
-    sanitized = re.sub(r"[^0-9A-Za-z_]+", "_", str(name))
-    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
-    if not sanitized:
-        sanitized = "feature"
-    if sanitized[0].isdigit():
-        sanitized = f"f_{sanitized}"
-    return sanitized
-
-
-def _sanitize_feature_columns(features: pd.DataFrame) -> pd.DataFrame:
-    sanitized_columns = [_sanitize_feature_name(col) for col in features.columns]
-    seen = {}
-    unique_columns = []
-    for col in sanitized_columns:
-        count = seen.get(col, 0)
-        unique_columns.append(col if count == 0 else f"{col}_{count}")
-        seen[col] = count + 1
-
-    changed = sum(old != new for old, new in zip(features.columns, unique_columns))
-    if changed:
-        _log(f"features: sanitized feature column names={changed:,}")
-
-    features = features.copy()
-    features.columns = unique_columns
-    return features
-
-
 def _normalize_feature_table_columns(df: pd.DataFrame) -> pd.DataFrame:
     if TIME_COL in df.columns or "zafra" not in df.columns:
         return df
@@ -299,7 +270,10 @@ def _window_aggregates(df: pd.DataFrame, columns):
     return pd.concat(pieces, axis=1)
 
 
-def build_aggregated_dataset(df: pd.DataFrame, target: str = TARGET):
+def build_aggregated_dataset(
+    df: pd.DataFrame,
+    target: str = TARGET,
+):
     _log("features: dropping rows without target/group/time")
     df = df.dropna(subset=[target, GROUP_COL, TIME_COL]).copy()
     df["fecha_stac"] = pd.to_datetime(df["fecha_stac"], errors="coerce")
@@ -353,11 +327,8 @@ def build_aggregated_dataset(df: pd.DataFrame, target: str = TARGET):
     labels = grouped[[target, "tc"]].first()
 
     features = pd.concat([static, base, slope_df, window_df], axis=1)
-    _log(f"features: before get_dummies columns={features.shape[1]:,}")
-    features = pd.get_dummies(features, dummy_na=True)
-    features = _sanitize_feature_columns(features)
     features = features.replace([np.inf, -np.inf], np.nan)
-    _log(f"features: final columns={features.shape[1]:,}")
+    _log(f"features: raw feature columns={features.shape[1]:,}")
 
     metadata_cols = [GROUP_COL, "cod_cg", TIME_COL, "area", "tc"]
     metadata = labels.join(metadata_static, how="left").reset_index()
@@ -410,11 +381,8 @@ def build_feature_table_dataset(
             axis=1,
         )
 
-    _log(f"features: before get_dummies columns={features.shape[1]:,}")
-    features = pd.get_dummies(features, dummy_na=True)
-    features = _sanitize_feature_columns(features)
     features = features.replace([np.inf, -np.inf], np.nan)
-    _log(f"features: final columns={features.shape[1]:,}")
+    _log(f"features: raw feature columns={features.shape[1]:,}")
 
     y = df[target].copy()
     return features, y, metadata
@@ -429,7 +397,11 @@ def build_dataset(
     if dataset_type == "aggregated":
         return build_aggregated_dataset(df, target=target)
     if dataset_type in {"feature_table", "preaggregated"}:
-        return build_feature_table_dataset(df, target=target, light_features=light_features)
+        return build_feature_table_dataset(
+            df,
+            target=target,
+            light_features=light_features,
+        )
     if dataset_type == "sequential":
         raise NotImplementedError("Sequential dataset support is planned but not implemented yet.")
     raise ValueError(f"Unknown dataset_type: {dataset_type}")

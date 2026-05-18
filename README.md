@@ -1,22 +1,35 @@
 # TCH Prediction Harvest Season
 
-This project builds a machine learning workflow for estimating sugarcane yield at the lot and harvest-season level.
+Machine learning workflow for estimating sugarcane yield (`tch`, tons of cane per hectare) at the lot-season level.
 
-The main prediction target is TCH, or tons of cane per hectare. Once TCH is predicted for each lot, those predictions can be combined with lot area to estimate total production for a harvest season. The workflow is designed around SQL-aggregated datasets so each training row represents one lot-season, making the modeling data easier to inspect, validate, and explain.
+The project keeps the database layer focused on raw longitudinal materialized views and builds model-ready feature tables from SQL. Training runs in SageMaker with a pinned Docker image, temporal validation by harvest season, controlled categorical encoding, and reproducible artifacts for diagnostics and audit.
 
-In practical terms, the pipeline turns field, satellite, weather, climate, and radar signals into a clean feature table, trains models in SageMaker, and writes diagnostics that help decide which features should be kept, removed, or redesigned in the next iteration.
+## Current Data Shape
 
-## Current Workflow
-
-The main workflow uses a pre-aggregated feature table:
+The raw longitudinal views are the canonical source:
 
 ```text
-queries/aggregated/tch_aggregated_features_v1.sql
+public.tch_raw_longitudinal_v2
+public.tch_raw_longitudinal_v3
+public.tch_raw_longitudinal_v4
 ```
 
-This SQL creates one row per `cod_cg_zafra` from `tch_raw_longitudinal`, preserving the cycle logic already computed in the raw longitudinal view.
+Each raw view keeps one row per lot-season-observation and contains cleaned categorical fields, optical features, climate joins, SAR joins, and cycle metadata.
 
-Minimum dataset contract:
+The current clean baseline feature table is:
+
+```text
+tch_features_v4_core_optical_climate
+```
+
+Its SQL lives in:
+
+```text
+queries/v4/aggregated/views/tch_features_v4_core_optical_climate.sql
+queries/v4/aggregated/queries/tch_features_v4_core_optical_climate.sql
+```
+
+The feature table contract for training is:
 
 ```text
 cod_cg_zafra
@@ -29,139 +42,223 @@ fecha_inicio_ciclo
 fecha_fin_ciclo
 ```
 
-`tch` is the plain target. `area` and `tc` are retained for metadata, reporting, and downstream production estimates; they are not used to transform the target.
+`tch` is the target. `area` and `tc` are retained for metadata and reporting, not as transformed targets.
 
-## Dataset In S3
+## Categorical Encoding
 
-Expected dataset location:
-
-```text
-s3://<bucket>/datasets/tch_aggregated_features_v1.parquet
-```
-
-Expected validation checks after dataset creation:
+Categorical handling is implemented in:
 
 ```text
-one row per cod_cg_zafra
-no duplicate cod_cg_zafra rows
-no nulls in tch/zafra_norm/area
+sagemaker/training/categorical_encoding.py
 ```
+
+Training supports:
+
+```text
+--categorical-mode controlled
+--categorical-mode native
+--categorical-mode none
+```
+
+`controlled` is the default. It learns allowed categories from the train split only, then applies the same vocabulary to train, validation, and test. Rare or unseen categories go to `__OTHER__`; nulls go to `__MISSING__`.
+
+Current controlled rules:
+
+```text
+prod_familia_de_suelo: min_count >= 30
+prod_variedad: top_n = 30 OR min_count >= 30
+prod_codigo_zae: min_count >= 30
+prod_ingenio: all
+prod_grupo_de_suelo: all
+prod_grupo_de_humedad: all
+prod_no_corte: all
+prod_cosecha: all
+```
+
+`prod_finca` is excluded from model inputs because it has high cardinality and can act like a location/identity memorization feature.
+
+`native` keeps categorical columns as strings for supported models. Currently that path is implemented for CatBoost. `none` drops categorical columns and uses numeric features only.
+
+Every training run writes:
+
+```text
+categorical_encoding.json
+feature_list.json
+split_metadata.json
+```
+
+## S3 Datasets
+
+Datasets are expected under:
+
+```text
+s3://ndvi-extraction/datasets/{dataset}.parquet
+```
+
+or, for partitioned/chunked datasets:
+
+```text
+s3://ndvi-extraction/datasets/{dataset}/
+```
+
+The upload script is:
+
+```text
+sagemaker/jobs/upload_dataset.py
+```
+
+It searches SQL in versioned query folders such as:
+
+```text
+queries/v4/aggregated/queries/
+queries/v4/sequential/queries/
+queries/v3/aggregated/queries/
+queries/v2/aggregated/queries/
+queries/v1/aggregated/queries/
+```
+
+Example upload:
+
+```powershell
+python sagemaker/jobs/upload_dataset.py tch_features_v4_core_optical_climate
+```
+
+If the backing SQL view does not exist in the database, create it temporarily in the DB session or materialize it intentionally before upload. Do not commit credentials or local `.tmp` exports.
 
 ## Training Image
 
-The custom SageMaker image is stored in ECR:
+The SageMaker image is built from:
 
 ```text
-<account-id>.dkr.ecr.<region>.amazonaws.com/tch-sagemaker-training:latest
+sagemaker/docker/Dockerfile
+sagemaker/docker/requirements.txt
 ```
 
-Get the exact image digest from ECR when a run needs to be audited:
-
-```powershell
-aws ecr describe-images `
-  --repository-name tch-sagemaker-training `
-  --image-ids imageTag=latest `
-  --query "imageDetails[0].imageDigest" `
-  --output text
-```
-
-If anything changes under `sagemaker/training/`, rebuild and push the image:
+Build and push:
 
 ```powershell
 $ACCOUNT_ID = aws sts get-caller-identity --query Account --output text
-$REGION = "<region>"
+$REGION = "us-east-1"
 $REPO = "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/tch-sagemaker-training"
 
-docker build -t "$REPO:latest" -f sagemaker/docker/Dockerfile sagemaker
+docker build -f sagemaker/docker/Dockerfile -t tch-sagemaker-training:latest sagemaker
 aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
-docker push "$REPO:latest"
+docker tag tch-sagemaker-training:latest "${REPO}:latest"
+docker push "${REPO}:latest"
 ```
 
-## Upload A Dataset
-
-`upload_dataset.py` looks for SQL files in:
+For experimental validation, use a specific tag instead of only `latest`, for example:
 
 ```text
-queries/datasets/
-queries/aggregated/
-queries/
-```
-
-Regenerate and upload the aggregated dataset:
-
-```powershell
-python sagemaker/jobs/upload_dataset.py tch_aggregated_features_v1
+920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:categorical-smoke
 ```
 
 ## Launch Training
 
-Aggregated feature-table datasets must be launched with:
+Feature-table datasets should use:
 
 ```text
 --dataset-type feature_table
 ```
 
-Full LightGBM example with Optuna, SHAP, and feature diagnostics:
+Fast AWS smoke run:
 
 ```powershell
-python sagemaker/jobs/launch_job.py tch_aggregated_features_v1 `
+python sagemaker/jobs/launch_job.py tch_features_v4_core_optical_climate `
   --dataset-type feature_table `
-  --model-type lightgbm `
-  --n-trials 10 `
-  --image-uri <account-id>.dkr.ecr.<region>.amazonaws.com/tch-sagemaker-training:latest
-```
-
-Fast run without SHAP:
-
-```powershell
-python sagemaker/jobs/launch_job.py tch_aggregated_features_v1 `
-  --dataset-type feature_table `
-  --model-type lightgbm `
-  --n-trials 10 `
+  --model-type ridge `
+  --n-trials 1 `
+  --categorical-mode controlled `
+  --no-quantiles `
   --no-shap `
-  --image-uri <account-id>.dkr.ecr.<region>.amazonaws.com/tch-sagemaker-training:latest
+  --no-diagnostics `
+  --image-uri 920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:categorical-smoke
 ```
 
-## Artifacts
+CatBoost native categorical run:
+
+```powershell
+python sagemaker/jobs/launch_job.py tch_features_v4_core_optical_climate `
+  --dataset-type feature_table `
+  --model-type catboost `
+  --n-trials 20 `
+  --categorical-mode native `
+  --image-uri 920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:latest
+```
+
+LightGBM controlled-dummy run:
+
+```powershell
+python sagemaker/jobs/launch_job.py tch_features_v4_core_optical_climate `
+  --dataset-type feature_table `
+  --model-type lightgbm `
+  --n-trials 50 `
+  --categorical-mode controlled `
+  --image-uri 920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:latest
+```
+
+## Outputs
 
 Training outputs are written to:
 
 ```text
-s3://<bucket>/experiments/{dataset}/{model_type}/{job_name}/
+s3://ndvi-extraction/experiments/{dataset}/{model_type}/{job_name}/
 ```
 
-Main SageMaker outputs:
+Main SageMaker objects:
 
 ```text
 output/model.tar.gz
 output/output.tar.gz
 ```
 
-Expected files inside `output.tar.gz`:
+Common files inside `output.tar.gz`:
 
 ```text
 metrics.json
 metrics_by_zafra.csv
+metrics_by_lot_error.csv
+metrics_by_tch_range.csv
+predictions_by_lot.csv
 split_metadata.json
 feature_list.json
+categorical_encoding.json
+best_params.json
+optuna_trials.csv
+```
+
+When enabled, diagnostics and SHAP add:
+
+```text
 feature_importance_shap.csv
 shap_values.parquet
 feature_missing_rate.csv
 feature_stability_by_split.csv
+feature_variance.csv
+feature_univariate_target_association.csv
 feature_correlation_pairs.csv
+feature_correlation_clusters.csv
+feature_interaction_candidates.csv
 feature_pruning_recommendations.csv
-best_params.json
 ```
 
-## Modeling Notes
+## Validation Notes
 
-The end-to-end workflow is designed to generate the evidence needed for feature pruning:
+The temporal split is:
 
 ```text
-SHAP importance
-feature correlation
-missing rate
-train vs validation/test stability
+train: 2020_2021, 2021_2022, 2022_2023
+validation: 2023_2024
+test: 2024_2025
 ```
 
-Use those diagnostics to decide whether to create a compact `v2` feature table or to exclude feature families in the training workflow.
+Use smoke jobs to validate pipeline mechanics, not model quality. A useful smoke confirms:
+
+```text
+S3 dataset loads
+feature table contract is satisfied
+categorical_encoding.json is written
+feature_list.json has expected controlled dummies
+metrics.json and predictions_by_lot.csv are produced
+SageMaker job completes
+```

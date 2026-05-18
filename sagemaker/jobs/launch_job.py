@@ -24,7 +24,11 @@ def launch(
     n_trials: int = 50,
     partitioned: bool = False,
     walk_forward: bool = False,
+    walk_forward_stability_penalty: float = 0.25,
     light_features: bool = True,
+    one_hot_features: bool = True,
+    categorical_mode: str = "controlled",
+    quantiles: bool = True,
     shap: bool = True,
     diagnostics: bool = True,
     image_uri: str = None,
@@ -35,7 +39,10 @@ def launch(
     session = sagemaker.Session(boto_session=boto3.Session(region_name=REGION))
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    job_name = f"tch-{dataset}-{model_type}-{timestamp}".replace("_", "-")
+    job_suffix = f"{model_type}-{timestamp}".replace("_", "-")
+    job_prefix_max = 63 - len("tch--") - len(job_suffix)
+    dataset_slug = dataset.replace("_", "-")[:job_prefix_max]
+    job_name = f"tch-{dataset_slug}-{job_suffix}"
 
     hyperparameters = {
         "model-type": model_type,
@@ -43,7 +50,11 @@ def launch(
         "target": target,
         "n-trials": n_trials,
         "walk-forward": str(walk_forward).lower(),
+        "walk-forward-stability-penalty": walk_forward_stability_penalty,
         "light-features": str(light_features).lower(),
+        "one-hot-features": str(one_hot_features).lower(),
+        "categorical-mode": categorical_mode,
+        "quantiles": str(quantiles).lower(),
         "shap": str(shap).lower(),
         "diagnostics": str(diagnostics).lower(),
     }
@@ -90,7 +101,11 @@ if __name__ == "__main__":
     parser.add_argument("--n-trials", type=int, default=50)
     parser.add_argument("--partitioned", action="store_true", help="Read dataset from s3://bucket/datasets/{dataset}/ parquet parts")
     parser.add_argument("--walk-forward", action="store_true")
+    parser.add_argument("--walk-forward-stability-penalty", type=float, default=0.25)
     parser.add_argument("--no-light-features", action="store_true", help="Disable light pandas-derived features for feature-table datasets")
+    parser.add_argument("--categorical-mode", default="controlled", choices=["controlled", "native", "none"])
+    parser.add_argument("--no-dummies", action="store_true", help="Keep categorical columns raw for CatBoost native categorical handling")
+    parser.add_argument("--no-quantiles", action="store_true", help="Skip quantile/uncertainty models for faster baseline runs")
     parser.add_argument("--no-shap", action="store_true", help="Skip SHAP generation for faster baseline runs")
     parser.add_argument("--no-diagnostics", action="store_true", help="Skip feature diagnostics artifacts")
     parser.add_argument("--image-uri", required=True, help="Custom SageMaker training image URI")
@@ -103,7 +118,11 @@ if __name__ == "__main__":
         args.n_trials,
         args.partitioned,
         args.walk_forward,
+        args.walk_forward_stability_penalty,
         not args.no_light_features,
+        not args.no_dummies,
+        "native" if args.no_dummies else args.categorical_mode,
+        not args.no_quantiles,
         not args.no_shap,
         not args.no_diagnostics,
         args.image_uri,
