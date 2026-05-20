@@ -31,6 +31,7 @@ from features import build_dataset
 from metrics import (
     lot_error_metrics,
     lot_predictions,
+    aggregate_zafra_metrics,
     quantile_interval_metrics,
     regression_metrics,
     tail_error_report,
@@ -658,6 +659,17 @@ def main():
             metrics_by_split.setdefault(split, {}).update(row)
         log(f"Quantile interval metrics: {metrics_by_quantile_interval.to_dict(orient='records')}")
 
+    metrics_by_zafra_aggregate = aggregate_zafra_metrics(metrics_by_zafra)
+    metrics_by_split["aggregate_zafra"] = {
+        row["split"]: {
+            key: (None if pd.isna(value) else value)
+            for key, value in row.items()
+            if key != "split"
+        }
+        for row in metrics_by_zafra_aggregate.to_dict(orient="records")
+    }
+    log(f"Aggregate zafra metrics: {metrics_by_zafra_aggregate.to_dict(orient='records')}")
+
     walk_forward_metrics = pd.DataFrame()
     if args.walk_forward:
         walk_forward_metrics = run_walk_forward(
@@ -691,6 +703,7 @@ def main():
     metrics_tail_error.to_csv(os.path.join(output_dir, "tail_error_report.csv"), index=False)
     metrics_by_zafra.to_csv(os.path.join(output_dir, "metrics_by_zafra.csv"), index=False)
     metrics_by_zafra.to_csv(os.path.join(output_dir, "tch_by_zafra.csv"), index=False)
+    metrics_by_zafra_aggregate.to_csv(os.path.join(output_dir, "metrics_by_zafra_aggregate.csv"), index=False)
     optuna_trials.to_csv(os.path.join(output_dir, "optuna_trials.csv"), index=False)
     if not walk_forward_metrics.empty:
         walk_forward_metrics.to_csv(os.path.join(output_dir, "walk_forward_metrics.csv"), index=False)

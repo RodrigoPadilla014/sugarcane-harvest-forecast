@@ -214,6 +214,7 @@ Common files inside `output.tar.gz`:
 ```text
 metrics.json
 metrics_by_zafra.csv
+metrics_by_zafra_aggregate.csv
 metrics_by_lot_error.csv
 metrics_by_tch_range.csv
 tail_error_report.csv
@@ -249,6 +250,20 @@ actual_tch_sum_within_p10_p90
 ```
 
 Area-weighted aggregate columns may also be present as diagnostics, but they are not the current optimization objective.
+
+`metrics_by_zafra_aggregate.csv` summarizes aggregate performance across all zafras and across splits with enough zafras to support R2:
+
+```text
+split
+zafras
+actual_tch_sum
+pred_tch_sum
+tch_sum_diff
+tch_sum_pct_diff
+zafra_tch_sum_mae
+zafra_tch_sum_rmse
+aggregate_zafra_r2
+```
 
 When enabled, diagnostics and SHAP add:
 

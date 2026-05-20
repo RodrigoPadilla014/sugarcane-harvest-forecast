@@ -209,6 +209,33 @@ def zafra_quantile_metrics(quantile_predictions: pd.DataFrame) -> pd.DataFrame:
     return grouped.drop(columns=["actual_tch_sum"]).reset_index()
 
 
+def aggregate_zafra_metrics(metrics_by_zafra: pd.DataFrame) -> pd.DataFrame:
+    def summarize(df: pd.DataFrame, label: str) -> dict:
+        actual = df["actual_tch_sum"].astype(float)
+        pred = df["pred_tch_sum"].astype(float)
+        diff = pred - actual
+        row = {
+            "split": label,
+            "zafras": int(len(df)),
+            "actual_tch_sum": float(actual.sum()),
+            "pred_tch_sum": float(pred.sum()),
+            "tch_sum_diff": float(diff.sum()),
+            "tch_sum_pct_diff": float(diff.sum() / actual.sum()) if actual.sum() else np.nan,
+            "zafra_tch_sum_mae": float(diff.abs().mean()) if len(df) else np.nan,
+            "zafra_tch_sum_rmse": float(np.sqrt(np.mean(diff**2))) if len(df) else np.nan,
+            "zafra_tch_sum_bias": float(diff.mean()) if len(df) else np.nan,
+            "aggregate_zafra_r2": np.nan,
+        }
+        if len(df) >= 2:
+            row["aggregate_zafra_r2"] = float(r2_score(actual, pred))
+        return row
+
+    rows = [summarize(metrics_by_zafra, "all")]
+    for split, df in metrics_by_zafra.groupby("split", dropna=False):
+        rows.append(summarize(df, split))
+    return pd.DataFrame(rows)
+
+
 def zafra_metrics(metadata: pd.DataFrame, y_true: pd.Series, y_pred, split: str) -> pd.DataFrame:
     df = lot_predictions(metadata, y_true, y_pred, split)
     df["actual_area_weighted_tch"] = df["actual_tch"] * df["area"] if "area" in df.columns else np.nan
