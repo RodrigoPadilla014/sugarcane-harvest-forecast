@@ -42,7 +42,8 @@ def lot_predictions(metadata: pd.DataFrame, y_true: pd.Series, y_pred, split: st
         "tch_abs_error",
         "tch_pct_error",
     ]
-    return df[[col for col in ordered_cols if col in df.columns]]
+    extra_cols = [col for col in df.columns if col not in ordered_cols]
+    return df[[col for col in [*ordered_cols, *extra_cols] if col in df.columns]]
 
 
 def lot_error_metrics(predictions_by_lot: pd.DataFrame) -> pd.DataFrame:
@@ -90,6 +91,76 @@ def tch_range_metrics(predictions_by_lot: pd.DataFrame) -> pd.DataFrame:
     return grouped.reset_index()
 
 
+def _error_summary(df: pd.DataFrame, group_cols, group_name: str) -> pd.DataFrame:
+    grouped = df.groupby(group_cols, observed=False, dropna=False).agg(
+        rows=("actual_tch", "size"),
+        actual_tch_mean=("actual_tch", "mean"),
+        pred_tch_mean=("pred_tch", "mean"),
+        actual_tch_median=("actual_tch", "median"),
+        pred_tch_median=("pred_tch", "median"),
+        tch_bias=("tch_error", "mean"),
+        tch_mae=("tch_abs_error", "mean"),
+        overprediction_pct=("tch_error", lambda values: float((values > 0).mean() * 100.0)),
+        underprediction_pct=("tch_error", lambda values: float((values < 0).mean() * 100.0)),
+    )
+    rmse = df.groupby(group_cols, observed=False, dropna=False)["tch_error"].apply(
+        lambda values: float(np.sqrt(np.mean(values**2))) if len(values) else np.nan
+    )
+    grouped["tch_rmse"] = rmse
+    for tolerance in TCH_TOLERANCES:
+        grouped[f"pct_within_{tolerance}_tch"] = df.groupby(group_cols, observed=False, dropna=False)[
+            "tch_abs_error"
+        ].apply(lambda values, t=tolerance: float((values <= t).mean() * 100.0) if len(values) else np.nan)
+
+    result = grouped.reset_index()
+    result.insert(0, "grouping", group_name)
+    return result
+
+
+def tail_error_report(predictions_by_lot: pd.DataFrame, min_rows: int = 30) -> pd.DataFrame:
+    df = predictions_by_lot.copy()
+    df["actual_tch_range"] = pd.cut(
+        df["actual_tch"],
+        bins=TCH_RANGE_BINS,
+        labels=TCH_RANGE_LABELS,
+        right=True,
+        include_lowest=True,
+    )
+    df["tail_group"] = pd.cut(
+        df["actual_tch"],
+        bins=[-np.inf, 85, 115, np.inf],
+        labels=["low", "middle", "high"],
+        right=True,
+        include_lowest=True,
+    )
+
+    grouping_specs = [
+        ("split_x_tch_range", ["split", "actual_tch_range"]),
+        ("split_x_tail_group", ["split", "tail_group"]),
+        ("split_x_zafra_x_tch_range", ["split", "zafra_norm", "actual_tch_range"]),
+    ]
+    context_cols = [
+        "prod_ingenio",
+        "prod_cosecha",
+        "prod_no_corte",
+        "prod_variedad",
+        "prod_grupo_de_suelo",
+        "prod_grupo_de_humedad",
+        "prod_codigo_zae",
+        "prod_familia_de_suelo",
+    ]
+    for col in context_cols:
+        if col in df.columns:
+            grouping_specs.append((f"split_x_{col}_x_tail_group", ["split", col, "tail_group"]))
+
+    reports = []
+    for group_name, group_cols in grouping_specs:
+        report = _error_summary(df, group_cols, group_name)
+        reports.append(report[report["rows"] >= min_rows])
+
+    return pd.concat(reports, ignore_index=True, sort=False)
+
+
 def quantile_interval_metrics(quantile_predictions: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for split, df in quantile_predictions.groupby("split", dropna=False):
@@ -113,11 +184,42 @@ def quantile_interval_metrics(quantile_predictions: pd.DataFrame) -> pd.DataFram
     return pd.DataFrame(rows)
 
 
+def zafra_quantile_metrics(quantile_predictions: pd.DataFrame) -> pd.DataFrame:
+    if quantile_predictions.empty:
+        return pd.DataFrame()
+
+    grouped = quantile_predictions.groupby(["split", "zafra_norm"], dropna=False).agg(
+        actual_tch_sum=("actual_tch", "sum"),
+        pred_tch_p10_sum=(QUANTILE_LOWER, "sum"),
+        pred_tch_p50_sum=(QUANTILE_MEDIAN, "sum"),
+        pred_tch_p90_sum=(QUANTILE_UPPER, "sum"),
+    )
+    grouped["p10_tch_sum_diff"] = grouped["pred_tch_p10_sum"] - grouped["actual_tch_sum"]
+    grouped["p50_tch_sum_diff"] = grouped["pred_tch_p50_sum"] - grouped["actual_tch_sum"]
+    grouped["p90_tch_sum_diff"] = grouped["pred_tch_p90_sum"] - grouped["actual_tch_sum"]
+    grouped["p10_tch_sum_pct_diff"] = grouped["p10_tch_sum_diff"] / grouped["actual_tch_sum"]
+    grouped["p50_tch_sum_pct_diff"] = grouped["p50_tch_sum_diff"] / grouped["actual_tch_sum"]
+    grouped["p90_tch_sum_pct_diff"] = grouped["p90_tch_sum_diff"] / grouped["actual_tch_sum"]
+    grouped["p10_p90_tch_sum_width"] = grouped["pred_tch_p90_sum"] - grouped["pred_tch_p10_sum"]
+    grouped["p10_p90_tch_sum_width_pct"] = grouped["p10_p90_tch_sum_width"] / grouped["actual_tch_sum"]
+    grouped["actual_tch_sum_within_p10_p90"] = grouped["actual_tch_sum"].between(
+        grouped["pred_tch_p10_sum"],
+        grouped["pred_tch_p90_sum"],
+    )
+    return grouped.drop(columns=["actual_tch_sum"]).reset_index()
+
+
 def zafra_metrics(metadata: pd.DataFrame, y_true: pd.Series, y_pred, split: str) -> pd.DataFrame:
     df = lot_predictions(metadata, y_true, y_pred, split)
+    df["actual_area_weighted_tch"] = df["actual_tch"] * df["area"] if "area" in df.columns else np.nan
+    df["pred_area_weighted_tch"] = df["pred_tch"] * df["area"] if "area" in df.columns else np.nan
 
     grouped = df.groupby("zafra_norm", dropna=False).agg(
         rows=("actual_tch", "size"),
+        actual_tch_sum=("actual_tch", "sum"),
+        pred_tch_sum=("pred_tch", "sum"),
+        actual_area_weighted_tch_sum=("actual_area_weighted_tch", "sum"),
+        pred_area_weighted_tch_sum=("pred_area_weighted_tch", "sum"),
         actual_tch_mean=("actual_tch", "mean"),
         pred_tch_mean=("pred_tch", "mean"),
         actual_tch_median=("actual_tch", "median"),
@@ -127,6 +229,19 @@ def zafra_metrics(metadata: pd.DataFrame, y_true: pd.Series, y_pred, split: str)
     )
     rmse = df.groupby("zafra_norm", dropna=False)["tch_error"].apply(lambda values: float(np.sqrt(np.mean(values**2))))
     grouped["tch_rmse"] = rmse
+    r2 = df.groupby("zafra_norm", dropna=False).apply(
+        lambda values: float(r2_score(values["actual_tch"], values["pred_tch"])) if len(values) >= 2 else np.nan,
+        include_groups=False,
+    )
+    grouped["r2"] = r2
+    grouped["tch_sum_diff"] = grouped["pred_tch_sum"] - grouped["actual_tch_sum"]
+    grouped["tch_sum_pct_diff"] = grouped["tch_sum_diff"] / grouped["actual_tch_sum"]
+    grouped["area_weighted_tch_sum_diff"] = (
+        grouped["pred_area_weighted_tch_sum"] - grouped["actual_area_weighted_tch_sum"]
+    )
+    grouped["area_weighted_tch_sum_pct_diff"] = (
+        grouped["area_weighted_tch_sum_diff"] / grouped["actual_area_weighted_tch_sum"]
+    )
     grouped["tch_mean_error"] = grouped["pred_tch_mean"] - grouped["actual_tch_mean"]
     grouped["tch_mean_pct_error"] = grouped["tch_mean_error"] / grouped["actual_tch_mean"]
     grouped.insert(0, "split", split)

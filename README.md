@@ -1,32 +1,31 @@
 # TCH Prediction Harvest Season
 
-Machine learning workflow for estimating sugarcane yield (`tch`, tons of cane per hectare) at the lot-season level.
+Machine learning workflow for estimating sugarcane `tch` and evaluating harvest-season aggregate behavior.
 
-The project keeps the database layer focused on raw longitudinal materialized views and builds model-ready feature tables from SQL. Training runs in SageMaker with a pinned Docker image, temporal validation by harvest season, controlled categorical encoding, and reproducible artifacts for diagnostics and audit.
-
-## Current Data Shape
-
-The raw longitudinal views are the canonical source:
+The current modeling target is still lot-season `tch`, but the primary decision metric is now the raw zafra aggregate:
 
 ```text
-public.tch_raw_longitudinal_v2
-public.tch_raw_longitudinal_v3
-public.tch_raw_longitudinal_v4
+actual_zafra_tch_sum = sum(actual_tch for all lots in the zafra)
+pred_zafra_tch_sum   = sum(pred_tch for all lots in the zafra)
+tch_sum_diff         = pred_zafra_tch_sum - actual_zafra_tch_sum
+tch_sum_pct_diff     = tch_sum_diff / actual_zafra_tch_sum
 ```
 
-Each raw view keeps one row per lot-season-observation and contains cleaned categorical fields, optical features, climate joins, SAR joins, and cycle metadata.
+Lot-level metrics remain important diagnostics. The training pipeline can optimize either lot-level fit or this aggregate zafra objective through the Optuna objective mode.
 
-The current clean baseline feature table is:
+## Current Dataset
+
+The active v4 dataset is the pseudo-sequential, no-radar, light-pruned feature table:
 
 ```text
-tch_features_v4_core_optical_climate
+tch_features_v4_pseudoseq_core_no_radar_light_pruned
 ```
 
-Its SQL lives in:
+Its SQL is built from the pseudo-sequential v4 feature blocks:
 
 ```text
-queries/v4/aggregated/views/tch_features_v4_core_optical_climate.sql
-queries/v4/aggregated/queries/tch_features_v4_core_optical_climate.sql
+queries/v4/pseudo_sequential/feature_blocks/
+queries/v4/pseudo_sequential/queries/
 ```
 
 The feature table contract for training is:
@@ -42,63 +41,20 @@ fecha_inicio_ciclo
 fecha_fin_ciclo
 ```
 
-`tch` is the target. `area` and `tc` are retained for metadata and reporting, not as transformed targets.
+`tch` is the model target. `area` and `tc` are retained for metadata, diagnostics, and optional production-style reporting. The aggregate objective currently uses raw `tch` sums, not area-weighted sums.
 
-## Categorical Encoding
-
-Categorical handling is implemented in:
-
-```text
-sagemaker/training/categorical_encoding.py
-```
-
-Training supports:
-
-```text
---categorical-mode controlled
---categorical-mode native
---categorical-mode none
-```
-
-`controlled` is the default. It learns allowed categories from the train split only, then applies the same vocabulary to train, validation, and test. Rare or unseen categories go to `__OTHER__`; nulls go to `__MISSING__`.
-
-Current controlled rules:
-
-```text
-prod_familia_de_suelo: min_count >= 30
-prod_variedad: top_n = 30 OR min_count >= 30
-prod_codigo_zae: min_count >= 30
-prod_ingenio: all
-prod_grupo_de_suelo: all
-prod_grupo_de_humedad: all
-prod_no_corte: all
-prod_cosecha: all
-```
-
-`prod_finca` is excluded from model inputs because it has high cardinality and can act like a location/identity memorization feature.
-
-`native` keeps categorical columns as strings for supported models. Currently that path is implemented for CatBoost. `none` drops categorical columns and uses numeric features only.
-
-Every training run writes:
-
-```text
-categorical_encoding.json
-feature_list.json
-split_metadata.json
-```
-
-## S3 Datasets
+## Upload Datasets
 
 Datasets are expected under:
 
 ```text
-s3://ndvi-extraction/datasets/{dataset}.parquet
+s3://<bucket>/datasets/{dataset}.parquet
 ```
 
 or, for partitioned/chunked datasets:
 
 ```text
-s3://ndvi-extraction/datasets/{dataset}/
+s3://<bucket>/datasets/{dataset}/
 ```
 
 The upload script is:
@@ -107,23 +63,21 @@ The upload script is:
 sagemaker/jobs/upload_dataset.py
 ```
 
-It searches SQL in versioned query folders such as:
+It searches versioned query folders, including:
 
 ```text
 queries/v4/aggregated/queries/
 queries/v4/sequential/queries/
-queries/v3/aggregated/queries/
-queries/v2/aggregated/queries/
-queries/v1/aggregated/queries/
+queries/v4/pseudo_sequential/queries/
 ```
 
-Example upload:
+Example:
 
 ```powershell
-python sagemaker/jobs/upload_dataset.py tch_features_v4_core_optical_climate
+python sagemaker/jobs/upload_dataset.py tch_features_v4_pseudoseq_core_no_radar_light_pruned
 ```
 
-If the backing SQL view does not exist in the database, create it temporarily in the DB session or materialize it intentionally before upload. Do not commit credentials or local `.tmp` exports.
+Database credentials must come from environment variables. Do not commit local exports, scratch scripts, or credentials.
 
 ## Training Image
 
@@ -147,13 +101,9 @@ docker tag tch-sagemaker-training:latest "${REPO}:latest"
 docker push "${REPO}:latest"
 ```
 
-For experimental validation, use a specific tag instead of only `latest`, for example:
+Prefer immutable tags for formal comparisons; `latest` is convenient for active iteration.
 
-```text
-920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:categorical-smoke
-```
-
-## Launch Training
+## Launch Jobs
 
 Feature-table datasets should use:
 
@@ -161,48 +111,95 @@ Feature-table datasets should use:
 --dataset-type feature_table
 ```
 
-Fast AWS smoke run:
+The launcher supports objective modes:
 
-```powershell
-python sagemaker/jobs/launch_job.py tch_features_v4_core_optical_climate `
-  --dataset-type feature_table `
-  --model-type ridge `
-  --n-trials 1 `
-  --categorical-mode controlled `
-  --no-quantiles `
-  --no-shap `
-  --no-diagnostics `
-  --image-uri 920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:categorical-smoke
+```text
+--objective-mode auto
+--objective-mode lot_rmse
+--objective-mode walk_forward_r2
+--objective-mode aggregate_tch_sum
 ```
 
-CatBoost native categorical run:
+`auto` preserves the legacy behavior: validation RMSE for standard tuning and walk-forward R2 for walk-forward tuning.
+
+Aggregate-aware CatBoost walk-forward run:
 
 ```powershell
-python sagemaker/jobs/launch_job.py tch_features_v4_core_optical_climate `
+$ACCOUNT_ID = aws sts get-caller-identity --query Account --output text
+$REGION = "us-east-1"
+$IMAGE_URI = "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/tch-sagemaker-training:latest"
+
+python sagemaker/jobs/launch_job.py tch_features_v4_pseudoseq_core_no_radar_light_pruned `
   --dataset-type feature_table `
   --model-type catboost `
   --n-trials 20 `
+  --walk-forward `
+  --objective-mode aggregate_tch_sum `
+  --aggregate-penalty 2.0 `
   --categorical-mode native `
-  --image-uri 920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:latest
+  --no-dummies `
+  --no-light-features `
+  --max-run 14400 `
+  --max-wait 14400 `
+  --image-uri $IMAGE_URI
 ```
 
-LightGBM controlled-dummy run:
+The aggregate objective minimizes:
+
+```text
+mean_rmse + aggregate_penalty * mean_abs_raw_tch_sum_pct_diff
+```
+
+The aggregate percent difference is measured in percentage points. For example, with `--aggregate-penalty 2.0`, a 3 percentage-point zafra-sum error adds 6 RMSE-equivalent points to the Optuna objective.
+
+Diagnostics-only run:
 
 ```powershell
-python sagemaker/jobs/launch_job.py tch_features_v4_core_optical_climate `
+python sagemaker/jobs/launch_job.py tch_features_v4_pseudoseq_core_no_radar_light_pruned `
   --dataset-type feature_table `
   --model-type lightgbm `
-  --n-trials 50 `
   --categorical-mode controlled `
-  --image-uri 920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:latest
+  --diagnostics-only `
+  --no-light-features `
+  --image-uri $IMAGE_URI
 ```
+
+Diagnostics-only mode runs before categorical encoding so pruning recommendations refer to raw feature-table columns rather than one-hot dummy columns.
+
+## Categorical Encoding
+
+Categorical handling is implemented in:
+
+```text
+sagemaker/training/categorical_encoding.py
+```
+
+Training supports:
+
+```text
+--categorical-mode controlled
+--categorical-mode native
+--categorical-mode none
+```
+
+`controlled` learns allowed categories from the train split only. Rare or unseen categories go to `__OTHER__`; nulls go to `__MISSING__`.
+
+`native` keeps categorical columns as strings for supported models. Currently this path is implemented for CatBoost. Use `--no-dummies` with CatBoost native mode.
+
+`prod_finca` is excluded from model inputs because it has high cardinality and can act like a location or identity memorization feature.
 
 ## Outputs
 
 Training outputs are written to:
 
 ```text
-s3://ndvi-extraction/experiments/{dataset}/{model_type}/{job_name}/
+s3://<bucket>/experiments/{dataset}/{model_type}/{job_name}/
+```
+
+Diagnostics-only outputs are written to:
+
+```text
+s3://<bucket>/experiments/{dataset}/diagnostics/{job_name}/
 ```
 
 Main SageMaker objects:
@@ -219,6 +216,7 @@ metrics.json
 metrics_by_zafra.csv
 metrics_by_lot_error.csv
 metrics_by_tch_range.csv
+tail_error_report.csv
 predictions_by_lot.csv
 split_metadata.json
 feature_list.json
@@ -226,6 +224,31 @@ categorical_encoding.json
 best_params.json
 optuna_trials.csv
 ```
+
+When quantiles are enabled, the pipeline also writes:
+
+```text
+predictions_by_lot_quantiles.csv
+metrics_by_quantile_interval.csv
+```
+
+`metrics_by_zafra.csv` includes aggregate totals and uncertainty-style stress bands:
+
+```text
+actual_tch_sum
+pred_tch_sum
+tch_sum_diff
+tch_sum_pct_diff
+pred_tch_p10_sum
+pred_tch_p50_sum
+pred_tch_p90_sum
+p10_tch_sum_diff
+p50_tch_sum_diff
+p90_tch_sum_diff
+actual_tch_sum_within_p10_p90
+```
+
+Area-weighted aggregate columns may also be present as diagnostics, but they are not the current optimization objective.
 
 When enabled, diagnostics and SHAP add:
 
@@ -237,6 +260,7 @@ feature_stability_by_split.csv
 feature_variance.csv
 feature_univariate_target_association.csv
 feature_correlation_pairs.csv
+feature_spearman_correlation_pairs.csv
 feature_correlation_clusters.csv
 feature_interaction_candidates.csv
 feature_pruning_recommendations.csv
@@ -252,13 +276,16 @@ validation: 2023_2024
 test: 2024_2025
 ```
 
-Use smoke jobs to validate pipeline mechanics, not model quality. A useful smoke confirms:
+Use walk-forward Optuna to compare aggregate behavior across multiple held-out harvest seasons. Use the fixed validation/test split to report final model behavior.
+
+For aggregate-focused experiments, compare at least:
 
 ```text
-S3 dataset loads
-feature table contract is satisfied
-categorical_encoding.json is written
-feature_list.json has expected controlled dummies
-metrics.json and predictions_by_lot.csv are produced
-SageMaker job completes
+metrics_by_zafra.csv
+metrics.json
+optuna_trials.csv
+walk_forward_metrics.csv
+tail_error_report.csv
 ```
+
+The most important aggregate columns are `tch_sum_diff` and `tch_sum_pct_diff`. Lot-level `r2`, `rmse`, and tail error reports should be read as supporting diagnostics, not the sole selection criteria.

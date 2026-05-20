@@ -18,6 +18,29 @@ def _numeric_frame(X: pd.DataFrame) -> pd.DataFrame:
     return X.select_dtypes(include="number")
 
 
+def _deduplicate_columns(X: pd.DataFrame) -> pd.DataFrame:
+    seen = {}
+    columns = []
+    for col in X.columns:
+        count = seen.get(col, 0)
+        columns.append(col if count == 0 else f"{col}_{count}")
+        seen[col] = count + 1
+
+    if list(X.columns) == columns:
+        return X
+    deduplicated = X.copy()
+    deduplicated.columns = columns
+    return deduplicated
+
+
+def _split_indexes(frame: pd.DataFrame, train_idx, validation_idx, test_idx) -> dict[str, pd.Index]:
+    return {
+        "train": pd.Index(train_idx).intersection(frame.index),
+        "validation": pd.Index(validation_idx).intersection(frame.index),
+        "test": pd.Index(test_idx).intersection(frame.index),
+    }
+
+
 def _safe_abs(value) -> float:
     if pd.isna(value):
         return 0.0
@@ -45,19 +68,35 @@ def _spearman_corr(left: pd.Series, right: pd.Series) -> float:
     return left.rank().corr(right.rank(), method="pearson")
 
 
-def save_missing_rate(X: pd.DataFrame, output_dir: str) -> pd.DataFrame:
+def save_missing_rate(
+    X: pd.DataFrame,
+    train_idx,
+    validation_idx,
+    test_idx,
+    output_dir: str,
+) -> pd.DataFrame:
+    splits = _split_indexes(X, train_idx, validation_idx, test_idx)
     rows = []
     for col in X.columns:
-        missing_rate = float(X[col].isna().mean())
+        split_stats = {}
+        for split, split_idx in splits.items():
+            values = X.loc[split_idx, col]
+            split_stats[f"{split}_missing_rate"] = float(values.isna().mean()) if len(values) else np.nan
+            split_stats[f"{split}_non_null_count"] = int(values.notna().sum())
+
+        overall_missing_rate = float(X[col].isna().mean())
         rows.append(
             {
                 "feature": col,
-                "missing_rate": missing_rate,
-                "non_null_count": int(X[col].notna().sum()),
+                "missing_rate": split_stats["train_missing_rate"],
+                "non_null_count": split_stats["train_non_null_count"],
+                "overall_missing_rate": overall_missing_rate,
+                "overall_non_null_count": int(X[col].notna().sum()),
                 "dtype": str(X[col].dtype),
+                **split_stats,
             }
         )
-    df = pd.DataFrame(rows).sort_values(["missing_rate", "feature"], ascending=[False, True])
+    df = pd.DataFrame(rows).sort_values(["train_missing_rate", "feature"], ascending=[False, True])
     df.to_csv(os.path.join(output_dir, "feature_missing_rate.csv"), index=False)
     return df
 
@@ -105,25 +144,36 @@ def save_split_stability(
 
 def save_feature_variance(
     X: pd.DataFrame,
+    train_idx,
+    validation_idx,
+    test_idx,
     output_dir: str,
     threshold: float = NEAR_ZERO_VARIANCE_THRESHOLD,
 ) -> pd.DataFrame:
     numeric = _numeric_frame(X)
+    splits = _split_indexes(numeric, train_idx, validation_idx, test_idx)
     rows = []
     for col in numeric.columns:
-        values = pd.to_numeric(numeric[col], errors="coerce")
-        variance = values.var(skipna=True)
+        split_stats = {}
+        for split, split_idx in splits.items():
+            values = pd.to_numeric(numeric.loc[split_idx, col], errors="coerce")
+            split_stats[f"{split}_variance"] = values.var(skipna=True)
+            split_stats[f"{split}_std"] = values.std(skipna=True)
+            split_stats[f"{split}_unique_count"] = int(values.nunique(dropna=True))
+
+        train_variance = split_stats["train_variance"]
         rows.append(
             {
                 "feature": col,
-                "variance": variance,
-                "std": values.std(skipna=True),
-                "unique_count": int(values.nunique(dropna=True)),
-                "near_zero_variance": bool(pd.notna(variance) and variance <= threshold),
+                "variance": train_variance,
+                "std": split_stats["train_std"],
+                "unique_count": split_stats["train_unique_count"],
+                "near_zero_variance": bool(pd.notna(train_variance) and train_variance <= threshold),
+                **split_stats,
             }
         )
 
-    df = pd.DataFrame(rows).sort_values(["near_zero_variance", "variance", "feature"], ascending=[False, True, True])
+    df = pd.DataFrame(rows).sort_values(["near_zero_variance", "train_variance", "feature"], ascending=[False, True, True])
     df.to_csv(os.path.join(output_dir, "feature_variance.csv"), index=False)
     return df
 
@@ -131,10 +181,12 @@ def save_feature_variance(
 def save_univariate_target_association(
     X: pd.DataFrame,
     y: pd.Series,
+    train_idx,
     output_dir: str,
     sample_rows: int = UNIVARIATE_SAMPLE_ROWS,
 ) -> pd.DataFrame:
-    numeric = _numeric_frame(X)
+    train_index = pd.Index(train_idx).intersection(X.index)
+    numeric = _numeric_frame(X.loc[train_index])
     aligned_y = pd.to_numeric(y.reindex(numeric.index), errors="coerce")
 
     rows = []
@@ -159,6 +211,7 @@ def save_univariate_target_association(
                 "spearman_abs": _safe_abs(spearman),
                 "valid_count": valid_count,
                 "unique_count": unique_count,
+                "reference_split": "train",
             }
         )
 
@@ -195,24 +248,28 @@ def save_univariate_target_association(
 
 def save_correlation_pairs(
     X: pd.DataFrame,
+    train_idx,
     output_dir: str,
     threshold: float = 0.98,
     max_features: int = 1200,
+    method: str = "pearson",
+    filename: str = "feature_correlation_pairs.csv",
 ) -> pd.DataFrame:
-    numeric = _numeric_frame(X)
+    train_index = pd.Index(train_idx).intersection(X.index)
+    numeric = _numeric_frame(X.loc[train_index])
     variance = numeric.var(skipna=True).sort_values(ascending=False)
     keep_cols = variance[variance > 0].head(max_features).index.tolist()
     if len(keep_cols) < 2:
         df = pd.DataFrame(columns=["feature_a", "feature_b", "abs_corr"])
-        df.to_csv(os.path.join(output_dir, "feature_correlation_pairs.csv"), index=False)
+        df.to_csv(os.path.join(output_dir, filename), index=False)
         return df
 
-    corr = numeric[keep_cols].corr().abs()
+    corr = numeric[keep_cols].corr(method=method).abs()
     mask = np.triu(np.ones(corr.shape, dtype=bool), k=1)
     pairs = corr.where(mask).stack().reset_index()
     pairs.columns = ["feature_a", "feature_b", "abs_corr"]
     pairs = pairs[pairs["abs_corr"] >= threshold].sort_values("abs_corr", ascending=False)
-    pairs.to_csv(os.path.join(output_dir, "feature_correlation_pairs.csv"), index=False)
+    pairs.to_csv(os.path.join(output_dir, filename), index=False)
     return pairs
 
 
@@ -329,11 +386,13 @@ def save_interaction_candidates(
     X: pd.DataFrame,
     y: pd.Series,
     univariate: pd.DataFrame,
+    train_idx,
     output_dir: str,
     top_features: int = INTERACTION_TOP_FEATURES,
     sample_rows: int = UNIVARIATE_SAMPLE_ROWS,
 ) -> pd.DataFrame:
-    numeric = _numeric_frame(X)
+    train_index = pd.Index(train_idx).intersection(X.index)
+    numeric = _numeric_frame(X.loc[train_index])
     aligned_y = pd.to_numeric(y.reindex(numeric.index), errors="coerce")
     candidate_cols = [
         col
@@ -423,16 +482,47 @@ def save_pruning_recommendations(
         strong_interactions = interactions.loc[interactions["interaction_gain"] > 0.02].head(100)
         interaction_candidates = set(strong_interactions["feature_a"]) | set(strong_interactions["feature_b"])
 
-    evidence = missing_rate[["feature", "missing_rate", "non_null_count"]].merge(
+    missing_cols = [
+        col
+        for col in [
+            "feature",
+            "missing_rate",
+            "non_null_count",
+            "overall_missing_rate",
+            "overall_non_null_count",
+            "train_missing_rate",
+            "validation_missing_rate",
+            "test_missing_rate",
+            "train_non_null_count",
+            "validation_non_null_count",
+            "test_non_null_count",
+        ]
+        if col in missing_rate.columns
+    ]
+    variance_cols = [
+        col
+        for col in [
+            "feature",
+            "variance",
+            "std",
+            "unique_count",
+            "train_variance",
+            "validation_variance",
+            "test_variance",
+            "train_unique_count",
+            "validation_unique_count",
+            "test_unique_count",
+            "near_zero_variance",
+        ]
+        if col in variance.columns
+    ]
+
+    evidence = missing_rate[missing_cols].merge(
         stability[["feature", "max_abs_mean_shift_std"]],
         on="feature",
         how="left",
     )
-    evidence = evidence.merge(
-        variance[["feature", "variance", "std", "unique_count", "near_zero_variance"]],
-        on="feature",
-        how="left",
-    )
+    evidence = evidence.merge(variance[variance_cols], on="feature", how="left")
     evidence = evidence.merge(
         univariate[["feature", "target_association_score", "spearman_abs", "mutual_info"]],
         on="feature",
@@ -491,9 +581,23 @@ def save_pruning_recommendations(
         "reasons",
         "missing_rate",
         "non_null_count",
+        "overall_missing_rate",
+        "overall_non_null_count",
+        "train_missing_rate",
+        "validation_missing_rate",
+        "test_missing_rate",
+        "train_non_null_count",
+        "validation_non_null_count",
+        "test_non_null_count",
         "variance",
         "std",
         "unique_count",
+        "train_variance",
+        "validation_variance",
+        "test_variance",
+        "train_unique_count",
+        "validation_unique_count",
+        "test_unique_count",
         "near_zero_variance",
         "max_abs_mean_shift_std",
         "target_association_score",
@@ -520,11 +624,19 @@ def save_feature_diagnostics(
     test_idx,
     output_dir: str,
 ) -> None:
-    missing_rate = save_missing_rate(X, output_dir)
+    X = _deduplicate_columns(X)
+    missing_rate = save_missing_rate(X, train_idx, validation_idx, test_idx, output_dir)
     stability = save_split_stability(X, train_idx, validation_idx, test_idx, output_dir)
-    variance = save_feature_variance(X, output_dir)
-    univariate = save_univariate_target_association(X, y, output_dir)
-    correlations = save_correlation_pairs(X, output_dir)
+    variance = save_feature_variance(X, train_idx, validation_idx, test_idx, output_dir)
+    univariate = save_univariate_target_association(X, y, train_idx, output_dir)
+    correlations = save_correlation_pairs(X, train_idx, output_dir)
+    save_correlation_pairs(
+        X,
+        train_idx,
+        output_dir,
+        method="spearman",
+        filename="feature_spearman_correlation_pairs.csv",
+    )
     correlation_clusters = save_correlation_clusters(correlations, missing_rate, stability, univariate, output_dir)
-    interactions = save_interaction_candidates(X, y, univariate, output_dir)
+    interactions = save_interaction_candidates(X, y, univariate, train_idx, output_dir)
     save_pruning_recommendations(missing_rate, stability, variance, correlation_clusters, univariate, interactions, output_dir)

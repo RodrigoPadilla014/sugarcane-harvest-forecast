@@ -356,7 +356,10 @@ def build_feature_table_dataset(
     df = df.set_index(GROUP_COL, drop=False)
     _log(f"features: usable feature rows={len(df):,}")
 
-    metadata_cols = [col for col in FEATURE_TABLE_METADATA_COLS if col in df.columns]
+    metadata_cols = []
+    for col in [*FEATURE_TABLE_METADATA_COLS, *STATIC_COLS]:
+        if col in df.columns and col not in metadata_cols:
+            metadata_cols.append(col)
     metadata = df[metadata_cols].copy()
     if GROUP_COL not in metadata.columns:
         metadata[GROUP_COL] = df.index

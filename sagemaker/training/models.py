@@ -49,7 +49,7 @@ def suggest_params(trial: optuna.Trial, model_type: str) -> dict:
         }
     if model_type == "catboost":
         return {
-            "iterations": trial.suggest_int("iterations", 300, 1500),
+            "iterations": trial.suggest_int("iterations", 300, 800),
             "depth": trial.suggest_int("depth", 3, 10),
             "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
             "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1e-3, 20.0, log=True),

@@ -27,7 +27,7 @@ SEQUENTIAL_DIR = QUERIES_DIR / "sequential"
 VERSIONED_QUERY_DIRS = [
     QUERIES_DIR / version / family / "queries"
     for version in ("v4", "v3", "v2", "v1")
-    for family in ("aggregated", "sequential")
+    for family in ("aggregated", "sequential", "pseudo_sequential")
 ]
 
 

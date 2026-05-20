@@ -33,8 +33,10 @@ from metrics import (
     lot_predictions,
     quantile_interval_metrics,
     regression_metrics,
+    tail_error_report,
     tch_range_metrics,
     zafra_metrics,
+    zafra_quantile_metrics,
 )
 from models import build_model, suggest_params
 from shap_utils import save_shap_values
@@ -42,6 +44,7 @@ from splits import temporal_split, walk_forward_splits
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 QUANTILE_ALPHAS = (0.10, 0.50, 0.90)
+OBJECTIVE_MODES = {"auto", "lot_rmse", "walk_forward_r2", "aggregate_tch_sum"}
 
 
 def log(message: str) -> None:
@@ -69,6 +72,20 @@ def hyperparameter(defaults: dict, name: str, default, cast=None):
     if cast is None:
         return value
     return cast(value)
+
+
+def resolve_objective_mode(objective_mode: str, walk_forward: bool) -> str:
+    if objective_mode == "auto":
+        return "walk_forward_r2" if walk_forward else "lot_rmse"
+    return objective_mode
+
+
+def aggregate_tch_sum_pct_diff(y_true: pd.Series, y_pred) -> float:
+    actual_sum = float(np.sum(y_true))
+    pred_sum = float(np.sum(y_pred))
+    if actual_sum == 0:
+        return 0.0
+    return 100.0 * (pred_sum - actual_sum) / actual_sum
 
 
 def load_parquet_dir(data_dir: str) -> pd.DataFrame:
@@ -226,8 +243,11 @@ def fit_with_optuna(
     walk_forward: bool,
     stability_penalty: float,
     categorical_mode: str,
+    objective_mode: str,
+    aggregate_penalty: float,
 ):
     walk_forward_folds = walk_forward_splits(metadata) if walk_forward else []
+    resolved_objective_mode = resolve_objective_mode(objective_mode, walk_forward)
 
     def objective(trial):
         params = suggest_params(trial, model_type)
@@ -235,6 +255,7 @@ def fit_with_optuna(
         if walk_forward:
             fold_scores = []
             fold_rmses = []
+            fold_aggregate_pct_diffs = []
             for validation_zafra, train_idx, validation_idx in walk_forward_folds:
                 train_idx = train_idx.intersection(X.index)
                 validation_idx = validation_idx.intersection(X.index)
@@ -247,25 +268,56 @@ def fit_with_optuna(
                 fold_metrics = regression_metrics(y.loc[validation_idx], pred)
                 fold_scores.append(fold_metrics["r2"])
                 fold_rmses.append(fold_metrics["rmse"])
+                fold_aggregate_pct_diffs.append(aggregate_tch_sum_pct_diff(y.loc[validation_idx], pred))
 
             if not fold_scores:
                 raise ValueError("Walk-forward objective produced no valid folds")
 
             mean_r2 = float(np.mean(fold_scores))
             std_r2 = float(np.std(fold_scores))
+            mean_rmse = float(np.mean(fold_rmses))
+            mean_abs_aggregate_pct_diff = float(np.mean(np.abs(fold_aggregate_pct_diffs)))
             trial.set_user_attr("fold_r2", fold_scores)
             trial.set_user_attr("fold_rmse", fold_rmses)
+            trial.set_user_attr("fold_aggregate_tch_sum_pct_diff", fold_aggregate_pct_diffs)
             trial.set_user_attr("mean_r2", mean_r2)
             trial.set_user_attr("std_r2", std_r2)
+            trial.set_user_attr("mean_rmse", mean_rmse)
+            trial.set_user_attr("mean_abs_aggregate_tch_sum_pct_diff", mean_abs_aggregate_pct_diff)
+            if resolved_objective_mode == "aggregate_tch_sum":
+                return mean_rmse + aggregate_penalty * mean_abs_aggregate_pct_diff
             return mean_r2 - stability_penalty * std_r2
 
         model = build_estimator(model_type, params)
         fit_model(model, model_type, X_train, y_train, categorical_mode)
         pred = model.predict(X_validation)
-        return regression_metrics(y_validation, pred)["rmse"]
+        rmse = regression_metrics(y_validation, pred)["rmse"]
+        aggregate_pct_diff = aggregate_tch_sum_pct_diff(y_validation, pred)
+        trial.set_user_attr("rmse", float(rmse))
+        trial.set_user_attr("aggregate_tch_sum_pct_diff", float(aggregate_pct_diff))
+        trial.set_user_attr("abs_aggregate_tch_sum_pct_diff", float(abs(aggregate_pct_diff)))
+        if resolved_objective_mode == "aggregate_tch_sum":
+            return rmse + aggregate_penalty * abs(aggregate_pct_diff)
+        return rmse
 
     def trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        if walk_forward:
+        if resolved_objective_mode == "aggregate_tch_sum":
+            if walk_forward:
+                mean_rmse = trial.user_attrs.get("mean_rmse")
+                mean_abs_agg = trial.user_attrs.get("mean_abs_aggregate_tch_sum_pct_diff")
+                log(
+                    f"Trial {trial.number + 1}/{n_trials} | aggregate_score={trial.value:.4f} | "
+                    f"mean_rmse={mean_rmse:.4f} | mean_abs_tch_sum_pct_diff={mean_abs_agg:.4f} | "
+                    f"best={study.best_value:.4f}"
+                )
+            else:
+                rmse = trial.user_attrs.get("rmse")
+                abs_agg = trial.user_attrs.get("abs_aggregate_tch_sum_pct_diff")
+                log(
+                    f"Trial {trial.number + 1}/{n_trials} | aggregate_score={trial.value:.4f} | "
+                    f"rmse={rmse:.4f} | abs_tch_sum_pct_diff={abs_agg:.4f} | best={study.best_value:.4f}"
+                )
+        elif walk_forward:
             mean_r2 = trial.user_attrs.get("mean_r2")
             std_r2 = trial.user_attrs.get("std_r2")
             log(
@@ -276,7 +328,8 @@ def fit_with_optuna(
         else:
             log(f"Trial {trial.number + 1}/{n_trials} | rmse={trial.value:.4f} | best={study.best_value:.4f}")
 
-    study = optuna.create_study(direction="maximize" if walk_forward else "minimize")
+    direction = "maximize" if resolved_objective_mode == "walk_forward_r2" else "minimize"
+    study = optuna.create_study(direction=direction)
     study.optimize(objective, n_trials=n_trials, callbacks=[trial_callback])
     return study.best_params, study
 
@@ -329,6 +382,13 @@ def main():
     parser.add_argument("--n-trials", type=int, default=hyperparameter(hp_defaults, "n-trials", 50, int))
     parser.add_argument("--walk-forward", type=parse_bool, default=hyperparameter(hp_defaults, "walk-forward", False, parse_bool))
     parser.add_argument("--walk-forward-stability-penalty", type=float, default=hyperparameter(hp_defaults, "walk-forward-stability-penalty", 0.25, float))
+    parser.add_argument(
+        "--objective-mode",
+        type=str,
+        default=hyperparameter(hp_defaults, "objective-mode", "auto"),
+        choices=sorted(OBJECTIVE_MODES),
+    )
+    parser.add_argument("--aggregate-penalty", type=float, default=hyperparameter(hp_defaults, "aggregate-penalty", 1.0, float))
     parser.add_argument("--light-features", type=parse_bool, default=hyperparameter(hp_defaults, "light-features", True, parse_bool))
     parser.add_argument("--one-hot-features", type=parse_bool, default=hyperparameter(hp_defaults, "one-hot-features", True, parse_bool))
     parser.add_argument(
@@ -340,9 +400,14 @@ def main():
     parser.add_argument("--quantiles", type=parse_bool, default=hyperparameter(hp_defaults, "quantiles", True, parse_bool))
     parser.add_argument("--shap", type=parse_bool, default=hyperparameter(hp_defaults, "shap", True, parse_bool))
     parser.add_argument("--diagnostics", type=parse_bool, default=hyperparameter(hp_defaults, "diagnostics", True, parse_bool))
+    parser.add_argument("--diagnostics-only", type=parse_bool, default=hyperparameter(hp_defaults, "diagnostics-only", False, parse_bool))
+    parser.add_argument("--skip-optuna", type=parse_bool, default=hyperparameter(hp_defaults, "skip-optuna", False, parse_bool))
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
         log(f"Ignoring unknown arguments: {unknown_args}")
+    if args.diagnostics_only:
+        args.diagnostics = True
+    resolved_objective_mode = resolve_objective_mode(args.objective_mode, args.walk_forward)
 
     data_dir = os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
     model_dir = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
@@ -378,6 +443,47 @@ def main():
             f"train={len(train_idx)}, validation={len(validation_idx)}, test={len(test_idx)}"
         )
 
+    if args.diagnostics_only:
+        log("Diagnostics-only mode enabled; saving pre-encoding diagnostics and exiting before tuning/training")
+        save_feature_diagnostics(X, y, train_idx, validation_idx, test_idx, output_dir)
+        with open(os.path.join(output_dir, "feature_list.json"), "w") as f:
+            json.dump(list(X.columns), f, indent=2)
+        with open(os.path.join(output_dir, "split_metadata.json"), "w") as f:
+            json.dump(
+                {
+                    "run_mode": "diagnostics_only",
+                    "diagnostics_stage": "pre_encoding",
+                    "dataset_type": args.dataset_type,
+                    "model_type": args.model_type,
+                    "target": args.target,
+                    "input_rows": int(len(input_df)),
+                    "matrix_rows": int(len(X)),
+                    "feature_count": int(X.shape[1]),
+                    "light_features": bool(args.light_features),
+                    "one_hot_features": bool(args.one_hot_features),
+                    "categorical_mode": categorical_mode,
+                    "categorical_columns": categorical_feature_columns(X),
+                    "quantiles": False,
+                    "walk_forward": bool(args.walk_forward),
+                    "walk_forward_stability_penalty": float(args.walk_forward_stability_penalty),
+                    "objective_mode": args.objective_mode,
+                    "resolved_objective_mode": resolved_objective_mode,
+                    "aggregate_penalty": float(args.aggregate_penalty),
+                    "shap": False,
+                    "diagnostics": True,
+                    "train_rows": int(len(train_idx)),
+                    "validation_rows": int(len(validation_idx)),
+                    "test_rows": int(len(test_idx)),
+                    "train_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[train_idx, "zafra_norm"].dropna().unique()),
+                    "validation_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[validation_idx, "zafra_norm"].dropna().unique()),
+                    "test_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[test_idx, "zafra_norm"].dropna().unique()),
+                },
+                f,
+                indent=2,
+            )
+        log("Diagnostics artifacts saved.")
+        return
+
     log("Encoding categorical features after temporal split")
     X, categorical_encoding_state = fit_transform_categorical_features(
         X,
@@ -405,28 +511,62 @@ def main():
     else:
         log("Skipping feature diagnostics")
 
-    if args.walk_forward:
+    if args.skip_optuna:
+        log(f"Skipping Optuna; using default parameters for model_type={args.model_type}")
+        best_params = {}
+        optuna_trials = pd.DataFrame()
+    elif args.walk_forward:
+        if resolved_objective_mode == "aggregate_tch_sum":
+            objective_description = (
+                "score=mean_rmse+"
+                f"{args.aggregate_penalty}*mean_abs_raw_tch_sum_pct_diff"
+            )
+        else:
+            objective_description = f"score=mean_r2-{args.walk_forward_stability_penalty}*std_r2"
         log(
             "Starting Optuna with walk-forward objective: "
-            f"model_type={args.model_type}, n_trials={args.n_trials}, "
-            f"score=mean_r2-{args.walk_forward_stability_penalty}*std_r2"
+            f"model_type={args.model_type}, n_trials={args.n_trials}, {objective_description}"
         )
+        best_params, study = fit_with_optuna(
+            X_train,
+            y_train,
+            X_validation,
+            y_validation,
+            X,
+            y,
+            metadata,
+            model_type=args.model_type,
+            n_trials=args.n_trials,
+            walk_forward=args.walk_forward,
+            stability_penalty=args.walk_forward_stability_penalty,
+            categorical_mode=categorical_mode,
+            objective_mode=args.objective_mode,
+            aggregate_penalty=args.aggregate_penalty,
+        )
+        optuna_trials = study.trials_dataframe()
     else:
-        log(f"Starting Optuna: model_type={args.model_type}, n_trials={args.n_trials}, score=validation_rmse")
-    best_params, study = fit_with_optuna(
-        X_train,
-        y_train,
-        X_validation,
-        y_validation,
-        X,
-        y,
-        metadata,
-        model_type=args.model_type,
-        n_trials=args.n_trials,
-        walk_forward=args.walk_forward,
-        stability_penalty=args.walk_forward_stability_penalty,
-        categorical_mode=categorical_mode,
-    )
+        if resolved_objective_mode == "aggregate_tch_sum":
+            objective_description = f"score=validation_rmse+{args.aggregate_penalty}*abs_raw_tch_sum_pct_diff"
+        else:
+            objective_description = "score=validation_rmse"
+        log(f"Starting Optuna: model_type={args.model_type}, n_trials={args.n_trials}, {objective_description}")
+        best_params, study = fit_with_optuna(
+            X_train,
+            y_train,
+            X_validation,
+            y_validation,
+            X,
+            y,
+            metadata,
+            model_type=args.model_type,
+            n_trials=args.n_trials,
+            walk_forward=args.walk_forward,
+            stability_penalty=args.walk_forward_stability_penalty,
+            categorical_mode=categorical_mode,
+            objective_mode=args.objective_mode,
+            aggregate_penalty=args.aggregate_penalty,
+        )
+        optuna_trials = study.trials_dataframe()
     log(f"Best params: {best_params}")
 
     log("Training final model on train split")
@@ -494,6 +634,7 @@ def main():
     predictions_by_lot = pd.concat(lot_prediction_frames, ignore_index=True)
     metrics_by_lot_error = lot_error_metrics(predictions_by_lot)
     metrics_by_tch_range = tch_range_metrics(predictions_by_lot)
+    metrics_tail_error = tail_error_report(predictions_by_lot)
     for row in metrics_by_lot_error.to_dict(orient="records"):
         split = row.pop("split")
         metrics_by_split.setdefault(split, {}).update(row)
@@ -505,6 +646,13 @@ def main():
     if quantile_prediction_frames:
         predictions_by_quantile = pd.concat(quantile_prediction_frames, ignore_index=True)
         metrics_by_quantile_interval = quantile_interval_metrics(predictions_by_quantile)
+        metrics_by_zafra_quantiles = zafra_quantile_metrics(predictions_by_quantile)
+        if not metrics_by_zafra_quantiles.empty:
+            metrics_by_zafra = metrics_by_zafra.merge(
+                metrics_by_zafra_quantiles,
+                on=["split", "zafra_norm"],
+                how="left",
+            )
         for row in metrics_by_quantile_interval.to_dict(orient="records"):
             split = row.pop("split")
             metrics_by_split.setdefault(split, {}).update(row)
@@ -540,9 +688,10 @@ def main():
         metrics_by_quantile_interval.to_csv(os.path.join(output_dir, "metrics_by_quantile_interval.csv"), index=False)
     metrics_by_lot_error.to_csv(os.path.join(output_dir, "metrics_by_lot_error.csv"), index=False)
     metrics_by_tch_range.to_csv(os.path.join(output_dir, "metrics_by_tch_range.csv"), index=False)
+    metrics_tail_error.to_csv(os.path.join(output_dir, "tail_error_report.csv"), index=False)
     metrics_by_zafra.to_csv(os.path.join(output_dir, "metrics_by_zafra.csv"), index=False)
     metrics_by_zafra.to_csv(os.path.join(output_dir, "tch_by_zafra.csv"), index=False)
-    study.trials_dataframe().to_csv(os.path.join(output_dir, "optuna_trials.csv"), index=False)
+    optuna_trials.to_csv(os.path.join(output_dir, "optuna_trials.csv"), index=False)
     if not walk_forward_metrics.empty:
         walk_forward_metrics.to_csv(os.path.join(output_dir, "walk_forward_metrics.csv"), index=False)
 
@@ -570,8 +719,12 @@ def main():
                 "quantile_alphas": list(QUANTILE_ALPHAS),
                 "walk_forward": bool(args.walk_forward),
                 "walk_forward_stability_penalty": float(args.walk_forward_stability_penalty),
-                "optuna_direction": study.direction.name,
-                "optuna_best_value": float(study.best_value),
+                "objective_mode": args.objective_mode,
+                "resolved_objective_mode": resolved_objective_mode,
+                "aggregate_penalty": float(args.aggregate_penalty),
+                "skip_optuna": bool(args.skip_optuna),
+                "optuna_direction": None if args.skip_optuna else study.direction.name,
+                "optuna_best_value": None if args.skip_optuna else float(study.best_value),
                 "shap": bool(args.shap),
                 "diagnostics": bool(args.diagnostics),
                 "train_rows": int(len(train_idx)),
