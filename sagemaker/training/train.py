@@ -362,9 +362,17 @@ def run_walk_forward(
         fit_model(model, model_type, X.loc[train_idx], y.loc[train_idx], categorical_mode)
         pred = model.predict(X.loc[validation_idx])
         fold_metrics = regression_metrics(y.loc[validation_idx], pred)
+        actual_tch_sum = float(y.loc[validation_idx].sum())
+        pred_tch_sum = float(np.sum(pred))
+        tch_sum_diff = pred_tch_sum - actual_tch_sum
         fold_metrics["validation_zafra"] = validation_zafra
         fold_metrics["train_rows"] = int(len(train_idx))
         fold_metrics["validation_rows"] = int(len(validation_idx))
+        fold_metrics["actual_tch_sum"] = actual_tch_sum
+        fold_metrics["pred_tch_sum"] = pred_tch_sum
+        fold_metrics["tch_sum_diff"] = tch_sum_diff
+        fold_metrics["tch_sum_pct_diff"] = tch_sum_diff / actual_tch_sum if actual_tch_sum else np.nan
+        fold_metrics["abs_tch_sum_pct_diff"] = abs(fold_metrics["tch_sum_pct_diff"])
         rows.append(fold_metrics)
     return pd.DataFrame(rows)
 

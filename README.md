@@ -304,3 +304,14 @@ tail_error_report.csv
 ```
 
 The most important aggregate columns are `tch_sum_diff` and `tch_sum_pct_diff`. Lot-level `r2`, `rmse`, and tail error reports should be read as supporting diagnostics, not the sole selection criteria.
+
+`walk_forward_metrics.csv` also reports held-out zafra aggregate stress metrics:
+
+```text
+validation_zafra
+actual_tch_sum
+pred_tch_sum
+tch_sum_diff
+tch_sum_pct_diff
+abs_tch_sum_pct_diff
+```
