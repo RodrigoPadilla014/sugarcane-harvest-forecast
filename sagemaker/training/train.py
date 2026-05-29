@@ -58,6 +58,14 @@ def parse_bool(value):
     return value.lower() in {"1", "true", "yes", "y"}
 
 
+def parse_csv_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [part.strip() for part in str(value).split(",") if part.strip()]
+
+
 def load_hyperparameter_defaults() -> dict:
     path = "/opt/ml/input/config/hyperparameters.json"
     if not os.path.exists(path):
@@ -411,12 +419,14 @@ def main():
     parser.add_argument("--diagnostics", type=parse_bool, default=hyperparameter(hp_defaults, "diagnostics", True, parse_bool))
     parser.add_argument("--diagnostics-only", type=parse_bool, default=hyperparameter(hp_defaults, "diagnostics-only", False, parse_bool))
     parser.add_argument("--skip-optuna", type=parse_bool, default=hyperparameter(hp_defaults, "skip-optuna", False, parse_bool))
+    parser.add_argument("--external-zafras", type=str, default=hyperparameter(hp_defaults, "external-zafras", ""))
     args, unknown_args = parser.parse_known_args()
     if unknown_args:
         log(f"Ignoring unknown arguments: {unknown_args}")
     if args.diagnostics_only:
         args.diagnostics = True
     resolved_objective_mode = resolve_objective_mode(args.objective_mode, args.walk_forward)
+    external_zafras = parse_csv_list(args.external_zafras)
 
     data_dir = os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
     model_dir = os.environ.get("SM_MODEL_DIR", "/opt/ml/model")
@@ -441,10 +451,26 @@ def main():
     log(f"Built raw feature matrix: rows={len(X):,}, features={X.shape[1]:,}")
 
     log("Creating temporal split")
-    train_idx, validation_idx, test_idx = temporal_split(metadata)
+    metadata_by_group = metadata.set_index("cod_cg_zafra")
+    external_idx = pd.Index([])
+    split_metadata = metadata
+    if external_zafras:
+        external_mask = metadata_by_group["zafra_norm"].isin(external_zafras)
+        external_idx = metadata_by_group.index[external_mask].intersection(X.index)
+        split_metadata = metadata[~metadata["cod_cg_zafra"].isin(external_idx)].copy()
+        log(
+            "Holding out external scoring zafras: "
+            f"{external_zafras} rows={len(external_idx):,}"
+        )
+
+    train_idx, validation_idx, test_idx = temporal_split(split_metadata)
     train_idx = train_idx.intersection(X.index)
     validation_idx = validation_idx.intersection(X.index)
     test_idx = test_idx.intersection(X.index)
+    if external_zafras:
+        train_idx = train_idx.difference(external_idx)
+        validation_idx = validation_idx.difference(external_idx)
+        test_idx = test_idx.difference(external_idx)
 
     if train_idx.empty or validation_idx.empty or test_idx.empty:
         raise ValueError(
@@ -478,14 +504,17 @@ def main():
                     "objective_mode": args.objective_mode,
                     "resolved_objective_mode": resolved_objective_mode,
                     "aggregate_penalty": float(args.aggregate_penalty),
+                    "external_zafras": external_zafras,
                     "shap": False,
                     "diagnostics": True,
                     "train_rows": int(len(train_idx)),
                     "validation_rows": int(len(validation_idx)),
                     "test_rows": int(len(test_idx)),
-                    "train_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[train_idx, "zafra_norm"].dropna().unique()),
-                    "validation_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[validation_idx, "zafra_norm"].dropna().unique()),
-                    "test_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[test_idx, "zafra_norm"].dropna().unique()),
+                    "external_rows": int(len(external_idx)),
+                    "train_zafras": sorted(metadata_by_group.loc[train_idx, "zafra_norm"].dropna().unique()),
+                    "validation_zafras": sorted(metadata_by_group.loc[validation_idx, "zafra_norm"].dropna().unique()),
+                    "test_zafras": sorted(metadata_by_group.loc[test_idx, "zafra_norm"].dropna().unique()),
+                    "external_zafras_present": sorted(metadata_by_group.loc[external_idx, "zafra_norm"].dropna().unique()) if len(external_idx) else [],
                 },
                 f,
                 indent=2,
@@ -511,7 +540,8 @@ def main():
     log(
         "Dataset: "
         f"input_rows={len(input_df):,}, matrix_rows={len(X):,}, features={X.shape[1]:,}, "
-        f"train={len(train_idx):,}, validation={len(validation_idx):,}, test={len(test_idx):,}"
+        f"train={len(train_idx):,}, validation={len(validation_idx):,}, "
+        f"test={len(test_idx):,}, external={len(external_idx):,}"
     )
 
     if args.diagnostics:
@@ -614,7 +644,10 @@ def main():
         "train": train_idx,
         "validation": validation_idx,
         "test": test_idx,
+        "external": external_idx,
     }.items():
+        if split_idx.empty:
+            continue
         split_metrics, split_zafra, split_lot_predictions = evaluate_split(
             model,
             X.loc[split_idx],
@@ -641,6 +674,8 @@ def main():
 
     metrics_by_zafra = pd.concat(zafra_frames, ignore_index=True)
     predictions_by_lot = pd.concat(lot_prediction_frames, ignore_index=True)
+    predictions_external = predictions_by_lot[predictions_by_lot["split"] == "external"].copy()
+    metrics_by_zafra_external = metrics_by_zafra[metrics_by_zafra["split"] == "external"].copy()
     metrics_by_lot_error = lot_error_metrics(predictions_by_lot)
     metrics_by_tch_range = tch_range_metrics(predictions_by_lot)
     metrics_tail_error = tail_error_report(predictions_by_lot)
@@ -683,7 +718,7 @@ def main():
         walk_forward_metrics = run_walk_forward(
             X,
             y,
-            metadata,
+            split_metadata,
             args.model_type,
             best_params,
             categorical_mode,
@@ -712,6 +747,10 @@ def main():
     metrics_by_zafra.to_csv(os.path.join(output_dir, "metrics_by_zafra.csv"), index=False)
     metrics_by_zafra.to_csv(os.path.join(output_dir, "tch_by_zafra.csv"), index=False)
     metrics_by_zafra_aggregate.to_csv(os.path.join(output_dir, "metrics_by_zafra_aggregate.csv"), index=False)
+    if not predictions_external.empty:
+        predictions_external.to_csv(os.path.join(output_dir, "predictions_external.csv"), index=False)
+    if not metrics_by_zafra_external.empty:
+        metrics_by_zafra_external.to_csv(os.path.join(output_dir, "metrics_by_zafra_external.csv"), index=False)
     optuna_trials.to_csv(os.path.join(output_dir, "optuna_trials.csv"), index=False)
     if not walk_forward_metrics.empty:
         walk_forward_metrics.to_csv(os.path.join(output_dir, "walk_forward_metrics.csv"), index=False)
@@ -743,6 +782,7 @@ def main():
                 "objective_mode": args.objective_mode,
                 "resolved_objective_mode": resolved_objective_mode,
                 "aggregate_penalty": float(args.aggregate_penalty),
+                "external_zafras": external_zafras,
                 "skip_optuna": bool(args.skip_optuna),
                 "optuna_direction": None if args.skip_optuna else study.direction.name,
                 "optuna_best_value": None if args.skip_optuna else float(study.best_value),
@@ -751,9 +791,11 @@ def main():
                 "train_rows": int(len(train_idx)),
                 "validation_rows": int(len(validation_idx)),
                 "test_rows": int(len(test_idx)),
-                "train_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[train_idx, "zafra_norm"].dropna().unique()),
-                "validation_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[validation_idx, "zafra_norm"].dropna().unique()),
-                "test_zafras": sorted(metadata.set_index("cod_cg_zafra").loc[test_idx, "zafra_norm"].dropna().unique()),
+                "external_rows": int(len(external_idx)),
+                "train_zafras": sorted(metadata_by_group.loc[train_idx, "zafra_norm"].dropna().unique()),
+                "validation_zafras": sorted(metadata_by_group.loc[validation_idx, "zafra_norm"].dropna().unique()),
+                "test_zafras": sorted(metadata_by_group.loc[test_idx, "zafra_norm"].dropna().unique()),
+                "external_zafras_present": sorted(metadata_by_group.loc[external_idx, "zafra_norm"].dropna().unique()) if len(external_idx) else [],
             },
             f,
             indent=2,

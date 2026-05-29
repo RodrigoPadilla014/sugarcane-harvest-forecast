@@ -35,7 +35,16 @@
 -- To recreate manually:
 -- CREATE MATERIALIZED VIEW public.tch_raw_longitudinal_v4 AS
 
-WITH prod_windows AS (
+WITH prod_source AS (
+         SELECT
+            p.*,
+            CASE
+                WHEN p.cierre::text ~ '^\d{4}-\d{2}-\d{2}$' THEN to_date(p.cierre::text, 'YYYY-MM-DD'::text)
+                WHEN p.cierre::text ~ '^\d{2}/\d{2}/\d{4}$' THEN to_date(p.cierre::text, 'DD/MM/YYYY'::text)
+                ELSE NULL::date
+            END AS cierre_date
+           FROM productividad p
+        ), prod_windows AS (
          SELECT
             lote,
             cod_cg_zafra,
@@ -43,17 +52,18 @@ WITH prod_windows AS (
             edad,
             cierre,
             zafra,
-            to_date(cierre, 'DD/MM/YYYY'::text) AS cierre_date,
-            (to_date(cierre, 'DD/MM/YYYY'::text)
+            cierre_date,
+            (cierre_date
               - make_interval(days => greatest(0, round((edad::double precision * 30.44))::integer))
             )::date AS fecha_inicio_baseline,
-            lag(to_date(cierre, 'DD/MM/YYYY'::text))
-                OVER (PARTITION BY lote ORDER BY to_date(cierre, 'DD/MM/YYYY'::text))
+            lag(cierre_date)
+                OVER (PARTITION BY lote ORDER BY cierre_date)
                 AS prev_cierre_date
-           FROM productividad
+           FROM prod_source
           WHERE tch IS NOT NULL
             AND NOT (tch < 20 OR tch > 150)
             AND cierre IS NOT NULL
+            AND cierre_date IS NOT NULL
             AND edad IS NOT NULL
         ), prod_v4 AS (
          SELECT
@@ -170,7 +180,7 @@ WITH prod_windows AS (
             p.tipo_quema AS prod_tipo_quema,
             p.para_cosecha_en_verde AS prod_para_cosecha_en_verde,
             p.cierre,
-            to_date(p.cierre, 'DD/MM/YYYY'::text) AS cierre_date,
+            pv.cierre_date,
             p.mes_de_cosecha AS prod_mes_de_cosecha,
             p.cosecha AS prod_cosecha,
             p.de_infestacion_barrenador AS prod_de_infestacion_barrenador,

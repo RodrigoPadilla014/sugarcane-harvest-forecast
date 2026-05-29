@@ -35,6 +35,9 @@ def launch(
     diagnostics: bool = True,
     diagnostics_only: bool = False,
     skip_optuna: bool = False,
+    external_zafras: str = "",
+    use_spot: bool = True,
+    instance_type: str = INSTANCE_TYPE,
     max_run: int = 14400,
     max_wait: int = 14400,
     image_uri: str = None,
@@ -69,6 +72,7 @@ def launch(
         "diagnostics": str(diagnostics).lower(),
         "diagnostics-only": str(diagnostics_only).lower(),
         "skip-optuna": str(skip_optuna).lower(),
+        "external-zafras": external_zafras,
     }
     metric_definitions = [
         {"Name": "rmse", "Regex": "'rmse': ([0-9\\.]+)"},
@@ -78,19 +82,22 @@ def launch(
     output_family = "diagnostics" if diagnostics_only else model_type
     output_path = f"s3://{BUCKET}/experiments/{dataset}/{output_family}/"
 
-    estimator = Estimator(
-        image_uri=image_uri,
-        role=ROLE_ARN,
-        instance_type=INSTANCE_TYPE,
-        instance_count=1,
-        sagemaker_session=session,
-        use_spot_instances=True,
-        max_wait=max_wait,
-        max_run=max_run,
-        hyperparameters=hyperparameters,
-        metric_definitions=metric_definitions,
-        output_path=output_path,
-    )
+    estimator_kwargs = {
+        "image_uri": image_uri,
+        "role": ROLE_ARN,
+        "instance_type": instance_type,
+        "instance_count": 1,
+        "sagemaker_session": session,
+        "use_spot_instances": use_spot,
+        "max_run": max_run,
+        "hyperparameters": hyperparameters,
+        "metric_definitions": metric_definitions,
+        "output_path": output_path,
+    }
+    if use_spot:
+        estimator_kwargs["max_wait"] = max_wait
+
+    estimator = Estimator(**estimator_kwargs)
 
     dataset_s3_uri = f"s3://{BUCKET}/datasets/{dataset}/" if partitioned else f"s3://{BUCKET}/datasets/{dataset}.parquet"
 
@@ -125,6 +132,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-diagnostics", action="store_true", help="Skip feature diagnostics artifacts")
     parser.add_argument("--diagnostics-only", action="store_true", help="Run feature diagnostics and exit before tuning/training")
     parser.add_argument("--skip-optuna", action="store_true", help="Train with model defaults instead of running Optuna")
+    parser.add_argument("--external-zafras", default="", help="Comma-separated zafras to score after training without fitting/tuning")
+    parser.add_argument("--no-spot", action="store_true", help="Use on-demand capacity instead of managed spot training")
+    parser.add_argument("--instance-type", default=INSTANCE_TYPE, help="SageMaker training instance type")
     parser.add_argument("--max-run", type=int, default=14400, help="Maximum training runtime in seconds")
     parser.add_argument("--max-wait", type=int, default=14400, help="Maximum total spot wait/runtime window in seconds")
     parser.add_argument("--image-uri", required=True, help="Custom SageMaker training image URI")
@@ -148,6 +158,9 @@ if __name__ == "__main__":
         not args.no_diagnostics,
         args.diagnostics_only,
         args.skip_optuna,
+        args.external_zafras,
+        not args.no_spot,
+        args.instance_type,
         args.max_run,
         args.max_wait,
         args.image_uri,
