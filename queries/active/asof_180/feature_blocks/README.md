@@ -4,7 +4,7 @@ These blocks document the source-family boundaries used by the final
 self-contained query:
 
 ```text
-queries/v5/asof_180/queries/tch_features_v5_asof_180d_core.sql
+queries/active/asof_180/queries/tch_features_v5_asof_180d_core.sql
 ```
 
 The final query embeds the same block structure as CTEs so

@@ -6,10 +6,8 @@ credentials/
 .claude/
 experiments/run.py
 literature/
-queries/diagnostics/_create_v2_matview.py
-queries/diagnostics/_create_v3_matview.py
-queries/diagnostics/_create_v4_matview.py
-queries/diagnostics/_run_audit.py
+queries/archive/
+queries/diagnostics/
 
 # Python
 __pycache__/

@@ -49,13 +49,13 @@ Feature values are computed only from data available at crop ages `0-180`.
 Main SQL:
 
 ```text
-queries/v5/asof_180/queries/tch_features_v5_asof_180d_core.sql
+queries/active/asof_180/queries/tch_features_v5_asof_180d_core.sql
 ```
 
 Feature block SQL:
 
 ```text
-queries/v5/asof_180/feature_blocks/
+queries/active/asof_180/feature_blocks/
 ```
 
 Feature blocks:
@@ -68,7 +68,7 @@ Feature blocks:
 The raw longitudinal template that feeds v5 is:
 
 ```text
-queries/template/v4/tch_raw_longitudinal_v4.sql
+queries/templates/raw_longitudinal/v4/tch_raw_longitudinal_v4.sql
 ```
 
 Categorical fields from `productividad` are normalized there with trimming,
@@ -182,19 +182,19 @@ mean_rmse + aggregate_penalty * mean_abs_raw_tch_sum_pct_diff
 
 ## Diagnostics
 
-Feature diagnostics for as-of-180 are under:
+Feature diagnostics for as-of-180 are local scratch material under:
 
 ```text
-queries/feature_diagnostics/v5_asof_180/
+queries/diagnostics/feature/v5_asof_180/
 ```
 
 The clean diagnostic methodology uses discovery years for feature decisions and
 keeps later years for validation/test/external checks.
 
-Anomalous zafra diagnostics are under:
+Anomalous zafra diagnostics are local scratch material under:
 
 ```text
-queries/zafra_diagnostics/v5/
+queries/diagnostics/zafra/v5/
 ```
 
 The current anomalous-zafra report focuses on `2023_2024`, where the baseline

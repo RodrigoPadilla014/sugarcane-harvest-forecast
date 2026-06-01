@@ -22,17 +22,18 @@ load_dotenv(ROOT / "credentials" / ".env")
 
 BUCKET = "ndvi-extraction"
 QUERIES_DIR = ROOT / "queries"
-AGGREGATED_DIR = QUERIES_DIR / "aggregated"
-SEQUENTIAL_DIR = QUERIES_DIR / "sequential"
-VERSIONED_QUERY_DIRS = [
-    QUERIES_DIR / version / family / "queries"
-    for version in ("v5", "v4", "v3", "v2", "v1")
-    for family in ("aggregated", "sequential", "pseudo_sequential", "asof_180")
+QUERY_SEARCH_DIRS = [
+    QUERIES_DIR / "active" / "asof_180" / "queries",
+    *[
+        QUERIES_DIR / "templates" / "raw_longitudinal" / version
+        for version in ("v5", "v4", "v3", "v2")
+    ],
+    QUERIES_DIR,
 ]
 
 
 def query_path(query_name: str) -> Path:
-    for directory in (AGGREGATED_DIR, SEQUENTIAL_DIR, *VERSIONED_QUERY_DIRS, QUERIES_DIR):
+    for directory in QUERY_SEARCH_DIRS:
         sql_file = directory / f"{query_name}.sql"
         if sql_file.exists():
             return sql_file
