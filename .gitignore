@@ -8,6 +8,7 @@ experiments/run.py
 literature/
 queries/archive/
 queries/diagnostics/
+queries/templates/
 
 # Python
 __pycache__/
