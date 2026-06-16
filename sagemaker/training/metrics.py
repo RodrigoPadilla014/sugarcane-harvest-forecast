@@ -10,12 +10,38 @@ QUANTILE_MEDIAN = "pred_tch_p50"
 QUANTILE_UPPER = "pred_tch_p90"
 
 
-def regression_metrics(y_true, y_pred):
+def regression_metrics(y_true, y_pred, sample_weight=None):
+    weights = None if sample_weight is None else np.asarray(sample_weight)
     return {
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "mae": float(mean_absolute_error(y_true, y_pred)),
-        "r2": float(r2_score(y_true, y_pred)),
-        "bias": float(np.mean(np.asarray(y_pred) - np.asarray(y_true))),
+        "rmse": float(
+            np.sqrt(
+                mean_squared_error(
+                    y_true,
+                    y_pred,
+                    sample_weight=weights,
+                )
+            )
+        ),
+        "mae": float(
+            mean_absolute_error(
+                y_true,
+                y_pred,
+                sample_weight=weights,
+            )
+        ),
+        "r2": float(
+            r2_score(
+                y_true,
+                y_pred,
+                sample_weight=weights,
+            )
+        ),
+        "bias": float(
+            np.average(
+                np.asarray(y_pred) - np.asarray(y_true),
+                weights=weights,
+            )
+        ),
     }
 
 
@@ -59,6 +85,48 @@ def lot_error_metrics(predictions_by_lot: pd.DataFrame) -> pd.DataFrame:
         for tolerance in TCH_TOLERANCES:
             row[f"pct_within_{tolerance}_tch"] = float((df["tch_abs_error"] <= tolerance).mean() * 100.0)
         rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def snapshot_day_metrics(predictions_by_lot: pd.DataFrame) -> pd.DataFrame:
+    if "snapshot_day" not in predictions_by_lot.columns:
+        return pd.DataFrame()
+
+    rows = []
+    for (split, snapshot_day), df in predictions_by_lot.groupby(
+        ["split", "snapshot_day"],
+        dropna=False,
+    ):
+        actual_sum = float(df["actual_tch"].sum())
+        pred_sum = float(df["pred_tch"].sum())
+        rows.append(
+            {
+                "split": split,
+                "snapshot_day": snapshot_day,
+                "rows": int(len(df)),
+                "cycles": int(
+                    df["cycle_id"].nunique()
+                    if "cycle_id" in df.columns
+                    else len(df)
+                ),
+                "rmse": float(np.sqrt(np.mean(df["tch_error"] ** 2))),
+                "mae": float(df["tch_abs_error"].mean()),
+                "r2": (
+                    float(r2_score(df["actual_tch"], df["pred_tch"]))
+                    if len(df) >= 2
+                    else np.nan
+                ),
+                "bias": float(df["tch_error"].mean()),
+                "actual_tch_sum": actual_sum,
+                "pred_tch_sum": pred_sum,
+                "tch_sum_diff": pred_sum - actual_sum,
+                "tch_sum_pct_diff": (
+                    (pred_sum - actual_sum) / actual_sum
+                    if actual_sum
+                    else np.nan
+                ),
+            }
+        )
     return pd.DataFrame(rows)
 
 
@@ -188,7 +256,10 @@ def zafra_quantile_metrics(quantile_predictions: pd.DataFrame) -> pd.DataFrame:
     if quantile_predictions.empty:
         return pd.DataFrame()
 
-    grouped = quantile_predictions.groupby(["split", "zafra_norm"], dropna=False).agg(
+    group_cols = ["split", "zafra_norm"]
+    if "snapshot_day" in quantile_predictions.columns:
+        group_cols.append("snapshot_day")
+    grouped = quantile_predictions.groupby(group_cols, dropna=False).agg(
         actual_tch_sum=("actual_tch", "sum"),
         pred_tch_p10_sum=(QUANTILE_LOWER, "sum"),
         pred_tch_p50_sum=(QUANTILE_MEDIAN, "sum"),
@@ -230,9 +301,21 @@ def aggregate_zafra_metrics(metrics_by_zafra: pd.DataFrame) -> pd.DataFrame:
             row["aggregate_zafra_r2"] = float(r2_score(actual, pred))
         return row
 
-    rows = [summarize(metrics_by_zafra, "all")]
-    for split, df in metrics_by_zafra.groupby("split", dropna=False):
-        rows.append(summarize(df, split))
+    rows = []
+    if "snapshot_day" in metrics_by_zafra.columns:
+        for snapshot_day, snapshot_df in metrics_by_zafra.groupby(
+            "snapshot_day",
+            dropna=False,
+        ):
+            rows.append(summarize(snapshot_df, f"all_snapshot_{snapshot_day}"))
+            for split, df in snapshot_df.groupby("split", dropna=False):
+                rows.append(
+                    summarize(df, f"{split}_snapshot_{snapshot_day}")
+                )
+    else:
+        rows.append(summarize(metrics_by_zafra, "all"))
+        for split, df in metrics_by_zafra.groupby("split", dropna=False):
+            rows.append(summarize(df, split))
     return pd.DataFrame(rows)
 
 
@@ -241,7 +324,10 @@ def zafra_metrics(metadata: pd.DataFrame, y_true: pd.Series, y_pred, split: str)
     df["actual_area_weighted_tch"] = df["actual_tch"] * df["area"] if "area" in df.columns else np.nan
     df["pred_area_weighted_tch"] = df["pred_tch"] * df["area"] if "area" in df.columns else np.nan
 
-    grouped = df.groupby("zafra_norm", dropna=False).agg(
+    group_cols = ["zafra_norm"]
+    if "snapshot_day" in df.columns:
+        group_cols.append("snapshot_day")
+    grouped = df.groupby(group_cols, dropna=False).agg(
         rows=("actual_tch", "size"),
         actual_tch_sum=("actual_tch", "sum"),
         pred_tch_sum=("pred_tch", "sum"),
@@ -254,9 +340,11 @@ def zafra_metrics(metadata: pd.DataFrame, y_true: pd.Series, y_pred, split: str)
         tch_bias=("tch_error", "mean"),
         tch_mae=("tch_abs_error", "mean"),
     )
-    rmse = df.groupby("zafra_norm", dropna=False)["tch_error"].apply(lambda values: float(np.sqrt(np.mean(values**2))))
+    rmse = df.groupby(group_cols, dropna=False)["tch_error"].apply(
+        lambda values: float(np.sqrt(np.mean(values**2)))
+    )
     grouped["tch_rmse"] = rmse
-    r2 = df.groupby("zafra_norm", dropna=False).apply(
+    r2 = df.groupby(group_cols, dropna=False).apply(
         lambda values: float(r2_score(values["actual_tch"], values["pred_tch"])) if len(values) >= 2 else np.nan,
         include_groups=False,
     )

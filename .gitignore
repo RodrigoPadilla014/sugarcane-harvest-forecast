@@ -5,6 +5,9 @@ credentials/
 .tmp/
 .claude/
 experiments/run.py
+ec2/config.env
+forecast_dashboard/
+.github/workflows/pages.yml
 literature/
 queries/archive/
 queries/diagnostics/
@@ -18,6 +21,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+catboost_info/
 
 # Virtual environments
 .venv/

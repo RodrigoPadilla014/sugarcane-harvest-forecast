@@ -35,7 +35,10 @@ def launch(
     diagnostics: bool = True,
     diagnostics_only: bool = False,
     skip_optuna: bool = False,
-    external_zafras: str = "",
+    train_zafras: str = "",
+    evaluation_zafras: str = "",
+    scoring_zafras: str = "",
+    exclude_features: str = "",
     use_spot: bool = True,
     instance_type: str = INSTANCE_TYPE,
     max_run: int = 14400,
@@ -72,7 +75,10 @@ def launch(
         "diagnostics": str(diagnostics).lower(),
         "diagnostics-only": str(diagnostics_only).lower(),
         "skip-optuna": str(skip_optuna).lower(),
-        "external-zafras": external_zafras,
+        "train-zafras": train_zafras,
+        "evaluation-zafras": evaluation_zafras,
+        "scoring-zafras": scoring_zafras,
+        "exclude-features": exclude_features,
     }
     metric_definitions = [
         {"Name": "rmse", "Regex": "'rmse': ([0-9\\.]+)"},
@@ -132,7 +138,10 @@ if __name__ == "__main__":
     parser.add_argument("--no-diagnostics", action="store_true", help="Skip feature diagnostics artifacts")
     parser.add_argument("--diagnostics-only", action="store_true", help="Run feature diagnostics and exit before tuning/training")
     parser.add_argument("--skip-optuna", action="store_true", help="Train with model defaults instead of running Optuna")
-    parser.add_argument("--external-zafras", default="", help="Comma-separated zafras to score after training without fitting/tuning")
+    parser.add_argument("--train-zafras", required=True, help="Comma-separated labeled zafras used to fit and tune the model")
+    parser.add_argument("--evaluation-zafras", required=True, help="Comma-separated labeled zafras used only for evaluation")
+    parser.add_argument("--scoring-zafras", default="", help="Comma-separated unlabeled zafras to predict")
+    parser.add_argument("--exclude-features", default="", help="Comma-separated feature columns to exclude from diagnostics, training, evaluation, and scoring")
     parser.add_argument("--no-spot", action="store_true", help="Use on-demand capacity instead of managed spot training")
     parser.add_argument("--instance-type", default=INSTANCE_TYPE, help="SageMaker training instance type")
     parser.add_argument("--max-run", type=int, default=14400, help="Maximum training runtime in seconds")
@@ -158,7 +167,10 @@ if __name__ == "__main__":
         not args.no_diagnostics,
         args.diagnostics_only,
         args.skip_optuna,
-        args.external_zafras,
+        args.train_zafras,
+        args.evaluation_zafras,
+        args.scoring_zafras,
+        args.exclude_features,
         not args.no_spot,
         args.instance_type,
         args.max_run,

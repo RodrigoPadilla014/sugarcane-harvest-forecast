@@ -26,13 +26,61 @@ TARGET_COLS = {TARGET, "tc"}
 
 FEATURE_TABLE_METADATA_COLS = [
     GROUP_COL,
+    "cycle_id",
     "cod_cg",
     TIME_COL,
     "zafra",
     "area",
     "tc",
     "fecha_inicio_ciclo",
+    "fecha_inicio_baseline",
     "fecha_fin_ciclo",
+    "as_of_date",
+    "as_of_age_days",
+    "min_prediction_age_days",
+    "max_prediction_age_days",
+    "cycle_duration_days",
+    "dataset_role",
+    "cycle_status",
+    "has_target_tch",
+    "cod_cg_zafra_original",
+    "zafra_norm_original",
+    "fecha_cierre_real",
+    "fecha_cierre_estimada",
+    "zafra_assignment_method",
+    "previous_zafra_norm",
+    "previous_fecha_inicio_ciclo",
+    "previous_fecha_cierre",
+    "previous_tch",
+    "previous_tc",
+    "start_rule",
+    "start_correction_days",
+    "prod_edad_meses",
+    "asof_valid",
+    "asof_optical_obs_ok",
+    "asof_optical_gap_ok",
+    "asof_radar_obs_ok",
+    "asof_radar_gap_ok",
+    "asof_climate_coverage_ok",
+    "asof_cycle_duration_ok",
+    "asof_ndvi_shape_ok",
+    "snapshot_type",
+    "snapshot_day",
+    "snapshot_date",
+    "snapshot_available",
+    "snapshot_weight",
+    "scoring_age_eligible",
+    "fecha_inicio_administrativa",
+    "fecha_inicio_por_cierre_anterior",
+    "diferencia_inicios_dias",
+    "temporal_confidence",
+    "possible_optical_disturbance",
+    "stac_lote_matched",
+    "stac_lote_match_method",
+    "radar_lote_matched",
+    "radar_lote_match_method",
+    "climate_lote_matched",
+    "climate_lote_match_method",
 ]
 
 STATIC_COLS = [
@@ -343,15 +391,21 @@ def build_feature_table_dataset(
     df: pd.DataFrame,
     target: str = TARGET,
     light_features: bool = True,
+    require_target: bool = True,
 ):
     df = _normalize_feature_table_columns(df).copy()
-    required_cols = {GROUP_COL, TIME_COL, target, "area"}
+    required_cols = {GROUP_COL, TIME_COL, "area"}
+    if require_target:
+        required_cols.add(target)
     missing_cols = sorted(required_cols - set(df.columns))
     if missing_cols:
         raise ValueError(f"Feature table missing required columns: {missing_cols}")
 
     _log("features: preparing pre-aggregated feature table")
-    df = df.dropna(subset=[GROUP_COL, TIME_COL, target]).copy()
+    required_values = [GROUP_COL, TIME_COL]
+    if require_target:
+        required_values.append(target)
+    df = df.dropna(subset=required_values).copy()
     df = df.drop_duplicates(subset=[GROUP_COL], keep="first")
     df = df.set_index(GROUP_COL, drop=False)
     _log(f"features: usable feature rows={len(df):,}")
@@ -387,7 +441,7 @@ def build_feature_table_dataset(
     features = features.replace([np.inf, -np.inf], np.nan)
     _log(f"features: raw feature columns={features.shape[1]:,}")
 
-    y = df[target].copy()
+    y = df[target].copy() if target in df.columns else pd.Series(np.nan, index=df.index, name=target)
     return features, y, metadata
 
 
@@ -396,6 +450,7 @@ def build_dataset(
     dataset_type: str = "aggregated",
     target: str = TARGET,
     light_features: bool = True,
+    require_target: bool = True,
 ):
     if dataset_type == "aggregated":
         return build_aggregated_dataset(df, target=target)
@@ -404,6 +459,7 @@ def build_dataset(
             df,
             target=target,
             light_features=light_features,
+            require_target=require_target,
         )
     if dataset_type == "sequential":
         raise NotImplementedError("Sequential dataset support is planned but not implemented yet.")

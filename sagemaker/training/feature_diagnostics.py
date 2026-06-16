@@ -33,11 +33,10 @@ def _deduplicate_columns(X: pd.DataFrame) -> pd.DataFrame:
     return deduplicated
 
 
-def _split_indexes(frame: pd.DataFrame, train_idx, validation_idx, test_idx) -> dict[str, pd.Index]:
+def _split_indexes(frame: pd.DataFrame, train_idx, evaluation_idx) -> dict[str, pd.Index]:
     return {
         "train": pd.Index(train_idx).intersection(frame.index),
-        "validation": pd.Index(validation_idx).intersection(frame.index),
-        "test": pd.Index(test_idx).intersection(frame.index),
+        "evaluation": pd.Index(evaluation_idx).intersection(frame.index),
     }
 
 
@@ -71,11 +70,10 @@ def _spearman_corr(left: pd.Series, right: pd.Series) -> float:
 def save_missing_rate(
     X: pd.DataFrame,
     train_idx,
-    validation_idx,
-    test_idx,
+    evaluation_idx,
     output_dir: str,
 ) -> pd.DataFrame:
-    splits = _split_indexes(X, train_idx, validation_idx, test_idx)
+    splits = _split_indexes(X, train_idx, evaluation_idx)
     rows = []
     for col in X.columns:
         split_stats = {}
@@ -104,15 +102,13 @@ def save_missing_rate(
 def save_split_stability(
     X: pd.DataFrame,
     train_idx,
-    validation_idx,
-    test_idx,
+    evaluation_idx,
     output_dir: str,
 ) -> pd.DataFrame:
     numeric = _numeric_frame(X)
     splits = {
         "train": train_idx.intersection(numeric.index),
-        "validation": validation_idx.intersection(numeric.index),
-        "test": test_idx.intersection(numeric.index),
+        "evaluation": evaluation_idx.intersection(numeric.index),
     }
 
     rows = []
@@ -125,16 +121,12 @@ def save_split_stability(
             "feature": col,
             "train_mean": train_mean,
             "train_std": train_std,
-            "validation_mean": numeric.loc[splits["validation"], col].mean(),
-            "validation_std": numeric.loc[splits["validation"], col].std(),
-            "test_mean": numeric.loc[splits["test"], col].mean(),
-            "test_std": numeric.loc[splits["test"], col].std(),
+            "evaluation_mean": numeric.loc[splits["evaluation"], col].mean(),
+            "evaluation_std": numeric.loc[splits["evaluation"], col].std(),
         }
         denom = train_std if pd.notna(train_std) and train_std > 0 else np.nan
-        row["validation_mean_shift_std"] = (row["validation_mean"] - train_mean) / denom
-        row["test_mean_shift_std"] = (row["test_mean"] - train_mean) / denom
-        shifts = np.abs([row["validation_mean_shift_std"], row["test_mean_shift_std"]])
-        row["max_abs_mean_shift_std"] = np.nan if np.isnan(shifts).all() else np.nanmax(shifts)
+        row["evaluation_mean_shift_std"] = (row["evaluation_mean"] - train_mean) / denom
+        row["max_abs_mean_shift_std"] = abs(row["evaluation_mean_shift_std"])
         rows.append(row)
 
     df = pd.DataFrame(rows).sort_values("max_abs_mean_shift_std", ascending=False, na_position="last")
@@ -145,13 +137,12 @@ def save_split_stability(
 def save_feature_variance(
     X: pd.DataFrame,
     train_idx,
-    validation_idx,
-    test_idx,
+    evaluation_idx,
     output_dir: str,
     threshold: float = NEAR_ZERO_VARIANCE_THRESHOLD,
 ) -> pd.DataFrame:
     numeric = _numeric_frame(X)
-    splits = _split_indexes(numeric, train_idx, validation_idx, test_idx)
+    splits = _split_indexes(numeric, train_idx, evaluation_idx)
     rows = []
     for col in numeric.columns:
         split_stats = {}
@@ -491,11 +482,9 @@ def save_pruning_recommendations(
             "overall_missing_rate",
             "overall_non_null_count",
             "train_missing_rate",
-            "validation_missing_rate",
-            "test_missing_rate",
+            "evaluation_missing_rate",
             "train_non_null_count",
-            "validation_non_null_count",
-            "test_non_null_count",
+            "evaluation_non_null_count",
         ]
         if col in missing_rate.columns
     ]
@@ -507,11 +496,9 @@ def save_pruning_recommendations(
             "std",
             "unique_count",
             "train_variance",
-            "validation_variance",
-            "test_variance",
+            "evaluation_variance",
             "train_unique_count",
-            "validation_unique_count",
-            "test_unique_count",
+            "evaluation_unique_count",
             "near_zero_variance",
         ]
         if col in variance.columns
@@ -584,20 +571,16 @@ def save_pruning_recommendations(
         "overall_missing_rate",
         "overall_non_null_count",
         "train_missing_rate",
-        "validation_missing_rate",
-        "test_missing_rate",
+        "evaluation_missing_rate",
         "train_non_null_count",
-        "validation_non_null_count",
-        "test_non_null_count",
+        "evaluation_non_null_count",
         "variance",
         "std",
         "unique_count",
         "train_variance",
-        "validation_variance",
-        "test_variance",
+        "evaluation_variance",
         "train_unique_count",
-        "validation_unique_count",
-        "test_unique_count",
+        "evaluation_unique_count",
         "near_zero_variance",
         "max_abs_mean_shift_std",
         "target_association_score",
@@ -620,14 +603,13 @@ def save_feature_diagnostics(
     X: pd.DataFrame,
     y: pd.Series,
     train_idx,
-    validation_idx,
-    test_idx,
+    evaluation_idx,
     output_dir: str,
 ) -> None:
     X = _deduplicate_columns(X)
-    missing_rate = save_missing_rate(X, train_idx, validation_idx, test_idx, output_dir)
-    stability = save_split_stability(X, train_idx, validation_idx, test_idx, output_dir)
-    variance = save_feature_variance(X, train_idx, validation_idx, test_idx, output_dir)
+    missing_rate = save_missing_rate(X, train_idx, evaluation_idx, output_dir)
+    stability = save_split_stability(X, train_idx, evaluation_idx, output_dir)
+    variance = save_feature_variance(X, train_idx, evaluation_idx, output_dir)
     univariate = save_univariate_target_association(X, y, train_idx, output_dir)
     correlations = save_correlation_pairs(X, train_idx, output_dir)
     save_correlation_pairs(
