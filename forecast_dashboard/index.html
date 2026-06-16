@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Progreso de Predicción TCH</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Monitor de predicción de zafra</p>
+          <h1>Progreso agregado de TCH</h1>
+        </div>
+        <div class="run-select">
+          <label for="runPicker">Corrida</label>
+          <select id="runPicker"></select>
+        </div>
+      </header>
+
+      <section class="hero-metrics" aria-label="Predicción actual">
+        <article class="primary-kpi">
+          <div class="kpi-header">
+            <span id="statusBadge" class="badge">Predicción parcial</span>
+            <span id="updatedAt" class="muted">Cargando...</span>
+          </div>
+          <p class="metric-label">Suma agregada de TCH predicho</p>
+          <div id="aggregateValue" class="aggregate-value">--</div>
+          <div class="range-row">
+            <span>P10</span>
+            <div class="range-track">
+              <div id="rangeFill" class="range-fill"></div>
+            </div>
+            <span>P90</span>
+          </div>
+          <p id="rangeText" class="range-text">Rango preliminar: --</p>
+        </article>
+
+        <article class="side-kpi">
+          <p class="metric-label">Lotes elegibles</p>
+          <div id="eligibleLots" class="side-value">--</div>
+          <div class="coverage-bar">
+            <div id="coverageFill"></div>
+          </div>
+          <p id="coverageText" class="muted">--</p>
+        </article>
+
+        <article class="side-kpi">
+          <p class="metric-label">Zafra objetivo</p>
+          <div id="targetZafra" class="side-value">--</div>
+          <p id="modelName" class="muted">--</p>
+        </article>
+      </section>
+
+      <section class="grid two-col">
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Evolución de la predicción</h2>
+              <p>Cómo cambia el estimado agregado cuando más lotes se vuelven elegibles.</p>
+            </div>
+          </div>
+          <canvas id="evolutionChart" height="220" aria-label="Gráfico de evolución de la predicción"></canvas>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Avance de cobertura</h2>
+              <p>Cobertura actual de predicción para la siguiente zafra.</p>
+            </div>
+          </div>
+          <div class="coverage-summary">
+            <div>
+              <span id="coveragePercent" class="coverage-number">--</span>
+              <span class="coverage-unit">elegible</span>
+            </div>
+            <dl>
+              <div><dt>Lotes pendientes</dt><dd id="pendingLots">--</dd></div>
+              <div><dt>Candidatos totales</dt><dd id="totalLots">--</dd></div>
+              <div><dt>Regla de elegibilidad</dt><dd>180+ días observados</dd></div>
+            </dl>
+          </div>
+        </article>
+      </section>
+
+      <section class="grid two-col">
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Error agregado histórico</h2>
+              <p>Validación walk-forward por zafra. Menor es mejor.</p>
+            </div>
+          </div>
+          <div id="walkForwardList" class="error-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>Validación externa por edad</h2>
+              <p>Error agregado para 2025-2026 por día de snapshot.</p>
+            </div>
+          </div>
+          <div id="snapshotList" class="snapshot-list"></div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2>Variables principales</h2>
+            <p>Entradas con mayor influencia en el modelo seleccionado.</p>
+          </div>
+        </div>
+        <div id="drivers" class="drivers"></div>
+      </section>
+
+      <footer>
+        <p>
+          Este dashboard monitorea una predicción agregada parcial. Se actualiza
+          cuando la nueva información mueve más lotes por encima del umbral de
+          180 días observados.
+        </p>
+      </footer>
+    </main>
+
+    <script src="./data/dashboard-data.js"></script>
+    <script src="./script.js"></script>
+  </body>
+</html>
