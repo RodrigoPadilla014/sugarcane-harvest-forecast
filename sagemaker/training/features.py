@@ -81,6 +81,8 @@ FEATURE_TABLE_METADATA_COLS = [
     "radar_lote_match_method",
     "climate_lote_matched",
     "climate_lote_match_method",
+    "last_hist_zafra_norm",
+    "last_hist_fecha_cierre_real",
 ]
 
 STATIC_COLS = [
@@ -93,7 +95,13 @@ STATIC_COLS = [
     "prod_familia_de_suelo",
     "prod_variedad",
     "prod_no_corte",
+    "prod_estrato",
     "prod_cosecha",
+    "last_hist_no_corte",
+    "last_hist_estrato",
+    "last_hist_ingenio",
+    "enso_phase_snapshot",
+    "enso_phase_precycle",
 ]
 
 METADATA_STATIC_COLS = ["cod_cg", TIME_COL, "area"]
@@ -104,7 +112,6 @@ EXCLUDED_FEATURE_COLS = {
     "prod_latitud",
     "prod_longitud",
     "prod_zona_longitudinal",
-    "prod_estrato",
     # Yield/lab/harvest outcome leakage.
     "prod_rendimiento",
     "prod_brix",
@@ -177,7 +184,6 @@ EXCLUDED_FEATURE_COLS = {
     "latitud",
     "longitud",
     "zona_longitudinal",
-    "estrato",
     "rendimiento",
     "brix",
     "pureza",
@@ -256,6 +262,29 @@ def _normalize_feature_table_columns(df: pd.DataFrame) -> pd.DataFrame:
     if TIME_COL in df.columns or "zafra" not in df.columns:
         return df
     return df.rename(columns={"zafra": TIME_COL})
+
+
+def _enso_phase(value) -> str:
+    if pd.isna(value):
+        return "missing"
+    try:
+        oni = float(value)
+    except (TypeError, ValueError):
+        return "missing"
+    if oni >= 0.5:
+        return "nino"
+    if oni <= -0.5:
+        return "nina"
+    return "neutral"
+
+
+def _add_enso_phase_features(df: pd.DataFrame) -> pd.DataFrame:
+    enriched = df.copy()
+    if "enso_oni_snapshot_mean" in enriched.columns and "enso_phase_snapshot" not in enriched.columns:
+        enriched["enso_phase_snapshot"] = enriched["enso_oni_snapshot_mean"].map(_enso_phase)
+    if "enso_oni_precycle_mean" in enriched.columns and "enso_phase_precycle" not in enriched.columns:
+        enriched["enso_phase_precycle"] = enriched["enso_oni_precycle_mean"].map(_enso_phase)
+    return enriched
 
 
 def _add_light_feature_table_features(features: pd.DataFrame) -> pd.DataFrame:
@@ -393,7 +422,7 @@ def build_feature_table_dataset(
     light_features: bool = True,
     require_target: bool = True,
 ):
-    df = _normalize_feature_table_columns(df).copy()
+    df = _add_enso_phase_features(_normalize_feature_table_columns(df)).copy()
     required_cols = {GROUP_COL, TIME_COL, "area"}
     if require_target:
         required_cols.add(target)

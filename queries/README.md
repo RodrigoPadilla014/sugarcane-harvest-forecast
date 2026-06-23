@@ -1,33 +1,29 @@
 # Query organization
 
-The query tree is organized by lifecycle and model version.
+The committed query tree keeps only the production dataset definition under
+`queries/active`. Earlier dataset versions can be kept locally under
+`queries/archive`, but archive content is intentionally ignored by Git.
 
 ```text
 queries/
-|-- active/          Current dataset SQL used for uploads and training
-|-- diagnostics/     Audits, runners, and diagnostic reports
-|-- templates/       Local reusable raw or longitudinal templates
-`-- archive/         Historical datasets, views, and experiments
+|-- active/          Current production dataset SQL
+`-- archive/         Local historical SQL and experiments, ignored by Git
 ```
 
 ## Active dataset
 
-The active dataset is v9:
+The active dataset is V10:
 
 ```text
-active/v9/dataset/tch_v9_productivity_snapshot_spine.sql
-active/v9/dataset/tch_features_v9_productivity_snapshots.sql
+active/v10/dataset/tch_v10_productivity_snapshot_spine.sql
+active/v10/dataset/tch_features_v10_productivity_history_snapshots.sql
 ```
-
-V9 is snapshot-aware and uses `productividad` as the historical source of truth.
-It keeps valid historical productive lot-cycles, creates fixed snapshots at
-180, 210, 240, 270, 300, and 340 days, and adds current scoring rows for
-`2026_2027` based on productive lots observed in `2025_2026`.
 
 Upload it as a partitioned parquet dataset:
 
 ```powershell
-python sagemaker/jobs/upload_dataset.py tch_features_v9_productivity_snapshots `
+python sagemaker/jobs/upload_dataset.py tch_features_v10_productivity_history_snapshots `
+  --chunked `
   --chunksize 50000 `
   --replace
 ```
@@ -35,62 +31,40 @@ python sagemaker/jobs/upload_dataset.py tch_features_v9_productivity_snapshots `
 The uploader resolves local SQL includes:
 
 ```text
-{{ include:tch_v9_productivity_snapshot_spine }}
+{{ include:tch_v10_productivity_snapshot_spine }}
 ```
 
-so feature SQL can compose reusable spine logic without duplicating the full
-query.
+so the feature query can reuse the snapshot spine without duplicating the full
+SQL.
 
-## Supporting active experiments
+## V10 dataset logic
 
-V7 and V8 remain under `active/` for comparison and rollback context:
+V10 is a snapshot-aware productivity dataset. It uses `productividad` as the
+historical source of truth for lot-cycle validity, then joins climate, optical,
+radar, ENSO, soil, variety, cut, and management features as explanatory inputs.
 
-```text
-active/v7/dataset/tch_features_v7_dynamic_all_cycles.sql
-active/v8/dataset/tch_features_v8_dynamic_radar.sql
-```
+Historical rows:
 
-V7 introduced dynamic as-of windows and explicit scoring validity. V8 preserved
-that structure while testing radar-first satellite features. V9 is the current
-candidate because it moves the design toward productividad-defined historical
-validity plus updateable scoring snapshots.
+- keep valid productive lot-cycles with usable TCH;
+- create fixed snapshots at 180, 210, 240, 270, 300, and 340 days;
+- apply snapshot weights so one cycle does not dominate only because it has
+  multiple snapshots;
+- include lagged historical productivity features computed only from earlier
+  zafras.
 
-## Diagnostics
+Scoring rows:
 
-Diagnostics are grouped by purpose:
-
-```text
-diagnostics/v7/
-diagnostics/v8/
-diagnostics/v9/
-diagnostics/scoring_coverage/
-diagnostics/productivity_transitions/
-```
-
-Generated diagnostic CSV/parquet outputs should go under `.tmp/` or another
-scratch location, not under `queries/active/`.
-
-## Historical material
-
-Older fixed-window datasets are archived by version:
-
-```text
-archive/v5/asof_180/
-archive/v6/asof_180/
-```
-
-Older aggregated, sequential, and pseudo-sequential experiments remain under
-`archive/v1` through `archive/v4`.
-
-`archive/`, `diagnostics/`, and `templates/` are intentionally ignored by Git.
-The committed active SQL should be limited to dataset definitions that are
-still useful for current training or comparison.
+- represent the next productive zafra;
+- include only lots old enough to be scored at the current snapshot date;
+- keep pending lots outside the scored population until enough observations are
+  available;
+- use the latest available historical productivity as the residual-model anchor.
 
 ## Conventions
 
-- Keep current candidate SQL under `active/<version>/dataset/`.
-- Put executable audits and their reports under `diagnostics/<version>/`.
-- Store generated CSV, parquet, and temporary outputs outside `queries/`.
-- Move superseded dataset SQL to `archive/<version>/`.
-- Name dataset files after the S3 dataset key used by the uploader/training
-  pipeline.
+- Keep exactly one committed production dataset under `active/`.
+- Move superseded SQL versions to `archive/`.
+- Do not commit generated CSV, parquet, credentials, local extracts, or
+  diagnostic outputs.
+- Name dataset files after the S3 dataset key expected by the uploader and
+  training runner.

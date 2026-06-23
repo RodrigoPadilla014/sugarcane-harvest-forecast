@@ -10,9 +10,14 @@ from metrics import (
 )
 from train import (
     aggregate_tch_sum_pct_diff,
+    composite_metric_tons_objective,
     fit_model,
+    high_yield_area_weighted_abs_bias,
+    model_target,
     partition_unified_rows,
+    reconstruct_tch_predictions,
     sample_weights_for_index,
+    worst_estrato_metric_tons_abs_pct_error,
 )
 
 
@@ -95,6 +100,39 @@ def main():
     )
     assert aggregate_error > 0
 
+    objective_metadata = metadata.copy()
+    objective_metadata["prod_estrato"] = np.where(
+        objective_metadata["cycle_id"].eq("A"),
+        "ALTO",
+        "MEDIO",
+    )
+    assert high_yield_area_weighted_abs_bias(
+        y,
+        prediction,
+        objective_metadata,
+        threshold=95.0,
+    ) > 0
+    assert worst_estrato_metric_tons_abs_pct_error(
+        y,
+        prediction,
+        objective_metadata,
+    ) > 0
+    control_score = composite_metric_tons_objective(
+        rmse=16.0,
+        abs_metric_tons_pct_diff=2.0,
+        aggregate_penalty=3.0,
+    )
+    assert control_score == 22.0
+    assert composite_metric_tons_objective(
+        rmse=16.0,
+        abs_metric_tons_pct_diff=2.0,
+        aggregate_penalty=3.0,
+        high_yield_abs_bias=10.0,
+        high_yield_penalty=0.0,
+        worst_estrato_abs_pct_error=5.0,
+        worst_estrato_penalty=0.0,
+    ) == control_score
+
     from models import build_model
 
     model = build_model("catboost", {"iterations": 2, "depth": 2})
@@ -107,6 +145,36 @@ def main():
         sample_weight=weights,
     )
     assert len(model.predict(X)) == len(X)
+
+    residual_X = X.copy()
+    residual_X["last_hist_tch"] = y.to_numpy() - 5.0
+    residual_y = model_target(y, residual_X, "residual_last_hist_tch")
+    assert np.allclose(residual_y.to_numpy(), 5.0)
+    reconstructed = reconstruct_tch_predictions(
+        residual_y.to_numpy(),
+        residual_X,
+        "residual_last_hist_tch",
+    )
+    assert np.allclose(reconstructed, y.to_numpy())
+    assert np.allclose(
+        reconstruct_tch_predictions(y.to_numpy(), X, "absolute"),
+        y.to_numpy(),
+    )
+    direct_X = X.copy()
+    direct_X["direct_area"] = np.linspace(1.0, 2.0, len(X))
+    direct_y = model_target(y, direct_X, "direct_metric_tons")
+    assert np.allclose(
+        direct_y.to_numpy(),
+        y.to_numpy() * direct_X["direct_area"].to_numpy(),
+    )
+    assert np.allclose(
+        reconstruct_tch_predictions(
+            direct_y.to_numpy(),
+            direct_X,
+            "direct_metric_tons",
+        ),
+        y.to_numpy(),
+    )
     print("snapshot support smoke test passed")
 
 

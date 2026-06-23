@@ -8,6 +8,7 @@ TCH_TOLERANCES = [5, 10, 15]
 QUANTILE_LOWER = "pred_tch_p10"
 QUANTILE_MEDIAN = "pred_tch_p50"
 QUANTILE_UPPER = "pred_tch_p90"
+ESTRATO_COL = "prod_estrato"
 
 
 def regression_metrics(y_true, y_pred, sample_weight=None):
@@ -130,6 +131,68 @@ def snapshot_day_metrics(predictions_by_lot: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def estrato_metrics(predictions_by_lot: pd.DataFrame) -> pd.DataFrame:
+    if ESTRATO_COL not in predictions_by_lot.columns:
+        return pd.DataFrame()
+
+    df = predictions_by_lot.copy()
+    df[ESTRATO_COL] = df[ESTRATO_COL].fillna("<sin estrato>")
+    df["actual_metric_tons"] = df["actual_tch"] * df["area"] if "area" in df.columns else np.nan
+    df["pred_metric_tons"] = df["pred_tch"] * df["area"] if "area" in df.columns else np.nan
+
+    group_cols = ["split", "zafra_norm", ESTRATO_COL]
+    if "snapshot_day" in df.columns:
+        group_cols.append("snapshot_day")
+
+    grouped = df.groupby(group_cols, dropna=False).agg(
+        rows=("actual_tch", "size"),
+        area_sum=("area", "sum"),
+        actual_tch_mean=("actual_tch", "mean"),
+        pred_tch_mean=("pred_tch", "mean"),
+        tch_bias=("tch_error", "mean"),
+        tch_mae=("tch_abs_error", "mean"),
+        actual_metric_tons_sum=("actual_metric_tons", "sum"),
+        pred_metric_tons_sum=("pred_metric_tons", "sum"),
+    )
+    grouped["tch_rmse"] = df.groupby(group_cols, dropna=False)["tch_error"].apply(
+        lambda values: float(np.sqrt(np.mean(values**2))) if len(values) else np.nan
+    )
+    grouped["metric_tons_diff"] = grouped["pred_metric_tons_sum"] - grouped["actual_metric_tons_sum"]
+    grouped["metric_tons_pct_diff"] = grouped["metric_tons_diff"] / grouped["actual_metric_tons_sum"]
+    return grouped.reset_index()
+
+
+def future_scoring_estrato_metrics(predictions: pd.DataFrame) -> pd.DataFrame:
+    if predictions.empty or ESTRATO_COL not in predictions.columns:
+        return pd.DataFrame()
+
+    df = predictions.copy()
+    df[ESTRATO_COL] = df[ESTRATO_COL].fillna("<sin estrato>")
+    df["pred_metric_tons"] = df["pred_tch"] * df["area"] if "area" in df.columns else np.nan
+    for percentile in (10, 50, 90):
+        col = f"pred_tch_p{percentile}"
+        if col in df.columns and "area" in df.columns:
+            df[f"pred_metric_tons_p{percentile}"] = df[col] * df["area"]
+
+    group_cols = ["zafra_norm", ESTRATO_COL]
+    if "snapshot_day" in df.columns:
+        group_cols.append("snapshot_day")
+
+    aggregations = {
+        "rows": ("pred_tch", "size"),
+        "area_sum": ("area", "sum"),
+        "pred_tch_mean": ("pred_tch", "mean"),
+        "pred_tch_median": ("pred_tch", "median"),
+        "pred_metric_tons_sum": ("pred_metric_tons", "sum"),
+    }
+    for percentile in (10, 50, 90):
+        col = f"pred_metric_tons_p{percentile}"
+        if col in df.columns:
+            aggregations[f"pred_metric_tons_p{percentile}_sum"] = (col, "sum")
+
+    return df.groupby(group_cols, dropna=False).agg(**aggregations).reset_index()
+
+
 def tch_range_metrics(predictions_by_lot: pd.DataFrame) -> pd.DataFrame:
     df = predictions_by_lot.copy()
     df["actual_tch_range"] = pd.cut(
@@ -216,6 +279,7 @@ def tail_error_report(predictions_by_lot: pd.DataFrame, min_rows: int = 30) -> p
         "prod_grupo_de_humedad",
         "prod_codigo_zae",
         "prod_familia_de_suelo",
+        ESTRATO_COL,
     ]
     for col in context_cols:
         if col in df.columns:

@@ -1,28 +1,47 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-DATASET_DEFAULT="tch_features_v9_productivity_snapshots"
-IMAGE_DEFAULT="920572019712.dkr.ecr.us-east-1.amazonaws.com/tch-sagemaker-training:latest"
+DATASET_DEFAULT="tch_features_v10_productivity_history_snapshots"
 BUCKET_DEFAULT="ndvi-extraction"
 REGION_DEFAULT="us-east-1"
 TRAIN_ZAFRAS_DEFAULT="2020_2021,2021_2022,2022_2023,2023_2024"
 EVALUATION_ZAFRAS_DEFAULT="2024_2025,2025_2026"
 SCORING_ZAFRAS_DEFAULT="2026_2027"
+ECR_REPOSITORY_DEFAULT="tch-sagemaker-training"
 
 STAGE=""
 DATASET="${TCH_DATASET:-$DATASET_DEFAULT}"
-IMAGE="${TCH_IMAGE:-$IMAGE_DEFAULT}"
 BUCKET="${TCH_BUCKET:-$BUCKET_DEFAULT}"
 AWS_REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$REGION_DEFAULT}}"
+AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-}"
+if [[ -z "$AWS_ACCOUNT_ID" && -z "${TCH_IMAGE:-}" ]]; then
+    AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+fi
+IMAGE_DEFAULT="${AWS_ACCOUNT_ID:+$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/${TCH_ECR_REPOSITORY:-$ECR_REPOSITORY_DEFAULT}:latest}"
+IMAGE="${TCH_IMAGE:-$IMAGE_DEFAULT}"
 WORK_ROOT="${TCH_WORK_ROOT:-$HOME/tch-training}"
 CPUS="${TCH_CPUS:-4}"
 MEMORY="${TCH_MEMORY:-14g}"
 SHM_SIZE="${TCH_SHM_SIZE:-2g}"
+CODE_DIR="${TCH_CODE_DIR:-}"
 EXCLUDE_FEATURES="${TCH_EXCLUDE_FEATURES:-}"
 TRAIN_ZAFRAS="${TCH_TRAIN_ZAFRAS:-$TRAIN_ZAFRAS_DEFAULT}"
 EVALUATION_ZAFRAS="${TCH_EVALUATION_ZAFRAS:-$EVALUATION_ZAFRAS_DEFAULT}"
 SCORING_ZAFRAS="${TCH_SCORING_ZAFRAS:-$SCORING_ZAFRAS_DEFAULT}"
 AGGREGATE_PENALTY="${TCH_AGGREGATE_PENALTY:-}"
+TARGET_MODE="${TCH_TARGET_MODE:-residual_last_hist_tch}"
+MODEL_TYPE="${TCH_MODEL_TYPE:-catboost}"
+WEIGHT_MODE="${TCH_WEIGHT_MODE:-snapshot_historical_tch}"
+WEIGHT_MAX_MULTIPLIER="${TCH_WEIGHT_MAX_MULTIPLIER:-1.25}"
+WEIGHT_DENSITY_BIN_WIDTH="${TCH_WEIGHT_DENSITY_BIN_WIDTH:-5.0}"
+HIGH_YIELD_PENALTY="${TCH_HIGH_YIELD_PENALTY:-0.0}"
+WORST_ESTRATO_PENALTY="${TCH_WORST_ESTRATO_PENALTY:-0.0}"
+FIXED_PARAMS_JSON="${TCH_FIXED_PARAMS_JSON:-}"
+FIXED_PARAMS_FILE="${TCH_FIXED_PARAMS_FILE:-}"
+SEARCH_PROFILE="${TCH_SEARCH_PROFILE:-default}"
+QUANTILES="${TCH_QUANTILES:-true}"
+WALK_FORWARD_QUANTILES="${TCH_WALK_FORWARD_QUANTILES:-false}"
+SHAP="${TCH_SHAP:-true}"
 REFRESH_DATASET=false
 PARTITIONED=true
 SKIP_PULL=false
@@ -43,8 +62,23 @@ Options:
   --cpus NUMBER               Docker CPU limit. Default: 4.
   --memory SIZE               Docker memory and memory+swap limit. Default: 14g.
   --shm-size SIZE             Container /dev/shm size. Default: 2g.
+  --code-dir PATH             Mount training code at /opt/ml/code read-only.
   --exclude-features CSV      Comma-separated approved feature exclusions.
   --aggregate-penalty NUMBER  Override the stage aggregate penalty.
+  --target-mode MODE          absolute, residual_last_hist_tch, or direct_metric_tons.
+  --model-type MODEL          catboost, ridge, lightgbm, random_forest, or xgboost.
+  --weight-mode MODE          snapshot, snapshot_sqrt_area, snapshot_density,
+                              snapshot_historical_tch, or snapshot_area_density.
+  --weight-max-multiplier N   Maximum effective modifier. Default: 1.0.
+  --weight-density-bin-width N  Density histogram width in TCH. Default: 5.0.
+  --high-yield-penalty N      Optional Optuna high-yield bias penalty. Default: 0.
+  --worst-estrato-penalty N   Optional Optuna worst-estrato penalty. Default: 0.
+  --fixed-params-json JSON    Fixed model parameters; requires baseline stage.
+  --fixed-params-file PATH    Read fixed model parameters from a JSON file.
+  --search-profile NAME       Optuna space: default or phase4_catboost.
+  --quantiles BOOL            Train final P10/P50/P90 models. Default: true.
+  --walk-forward-quantiles BOOL  Save leakage-safe fold P10/P50/P90. Default: false.
+  --shap BOOL                 Generate SHAP artifacts. Default: true.
   --partitioned               Read parquet parts from datasets/NAME/.
   --refresh-dataset           Download the dataset again from S3.
   --skip-pull                 Use the Docker image already present on the host.
@@ -104,12 +138,68 @@ while (($#)); do
             SHM_SIZE="${2:?Missing value for --shm-size}"
             shift 2
             ;;
+        --code-dir)
+            CODE_DIR="${2:?Missing value for --code-dir}"
+            shift 2
+            ;;
         --exclude-features)
             EXCLUDE_FEATURES="${2:?Missing value for --exclude-features}"
             shift 2
             ;;
         --aggregate-penalty)
             AGGREGATE_PENALTY="${2:?Missing value for --aggregate-penalty}"
+            shift 2
+            ;;
+        --target-mode)
+            TARGET_MODE="${2:?Missing value for --target-mode}"
+            shift 2
+            ;;
+        --model-type)
+            MODEL_TYPE="${2:?Missing value for --model-type}"
+            shift 2
+            ;;
+        --weight-mode)
+            WEIGHT_MODE="${2:?Missing value for --weight-mode}"
+            shift 2
+            ;;
+        --weight-max-multiplier)
+            WEIGHT_MAX_MULTIPLIER="${2:?Missing value for --weight-max-multiplier}"
+            shift 2
+            ;;
+        --weight-density-bin-width)
+            WEIGHT_DENSITY_BIN_WIDTH="${2:?Missing value for --weight-density-bin-width}"
+            shift 2
+            ;;
+        --high-yield-penalty)
+            HIGH_YIELD_PENALTY="${2:?Missing value for --high-yield-penalty}"
+            shift 2
+            ;;
+        --worst-estrato-penalty)
+            WORST_ESTRATO_PENALTY="${2:?Missing value for --worst-estrato-penalty}"
+            shift 2
+            ;;
+        --fixed-params-json)
+            FIXED_PARAMS_JSON="${2:?Missing value for --fixed-params-json}"
+            shift 2
+            ;;
+        --fixed-params-file)
+            FIXED_PARAMS_FILE="${2:?Missing value for --fixed-params-file}"
+            shift 2
+            ;;
+        --search-profile)
+            SEARCH_PROFILE="${2:?Missing value for --search-profile}"
+            shift 2
+            ;;
+        --quantiles)
+            QUANTILES="${2:?Missing value for --quantiles}"
+            shift 2
+            ;;
+        --walk-forward-quantiles)
+            WALK_FORWARD_QUANTILES="${2:?Missing value for --walk-forward-quantiles}"
+            shift 2
+            ;;
+        --shap)
+            SHAP="${2:?Missing value for --shap}"
             shift 2
             ;;
         --partitioned)
@@ -146,6 +236,51 @@ done
     usage
     die "A stage is required"
 }
+[[ -n "$IMAGE" ]] ||
+    die "Docker image URI is required. Set TCH_IMAGE or AWS_ACCOUNT_ID so the default ECR image can be resolved."
+[[ "$TARGET_MODE" == "absolute" || "$TARGET_MODE" == "residual_last_hist_tch" || "$TARGET_MODE" == "direct_metric_tons" ]] ||
+    die "Unknown --target-mode: $TARGET_MODE"
+case "$MODEL_TYPE" in
+    catboost|ridge|lightgbm|random_forest|xgboost) ;;
+    *) die "Unknown --model-type: $MODEL_TYPE" ;;
+esac
+case "$WEIGHT_MODE" in
+    snapshot|snapshot_sqrt_area|snapshot_density|snapshot_historical_tch|snapshot_area_density) ;;
+    *) die "Unknown --weight-mode: $WEIGHT_MODE" ;;
+esac
+case "$SEARCH_PROFILE" in
+    default|phase4_catboost) ;;
+    *) die "Unknown --search-profile: $SEARCH_PROFILE" ;;
+esac
+case "$QUANTILES" in
+    true|false) ;;
+    *) die "Unknown --quantiles value: $QUANTILES" ;;
+esac
+case "$WALK_FORWARD_QUANTILES" in
+    true|false) ;;
+    *) die "Unknown --walk-forward-quantiles value: $WALK_FORWARD_QUANTILES" ;;
+esac
+case "$SHAP" in
+    true|false) ;;
+    *) die "Unknown --shap value: $SHAP" ;;
+esac
+if [[ -n "$FIXED_PARAMS_JSON" && -n "$FIXED_PARAMS_FILE" ]]; then
+    die "Use only one of --fixed-params-json or --fixed-params-file"
+fi
+if [[ -n "$FIXED_PARAMS_FILE" ]]; then
+    [[ -f "$FIXED_PARAMS_FILE" ]] || die "Fixed params file not found: $FIXED_PARAMS_FILE"
+    FIXED_PARAMS_JSON="$(<"$FIXED_PARAMS_FILE")"
+fi
+if [[ -n "$FIXED_PARAMS_JSON" && "$STAGE" != "baseline" ]]; then
+    die "--fixed-params-json currently requires the baseline stage"
+fi
+if [[ "$MODEL_TYPE" == "catboost" ]]; then
+    CATEGORICAL_MODE="native"
+    ONE_HOT_FEATURES="false"
+else
+    CATEGORICAL_MODE="controlled"
+    ONE_HOT_FEATURES="true"
+fi
 
 case "$STAGE" in
     diagnostics)
@@ -166,7 +301,7 @@ case "$STAGE" in
             --walk-forward true
             --skip-optuna true
             --n-trials 50
-            --objective-mode aggregate_tch_sum
+            --objective-mode aggregate_metric_tons
             --aggregate-penalty 1.5
         )
         ;;
@@ -177,7 +312,7 @@ case "$STAGE" in
             --walk-forward true
             --skip-optuna false
             --n-trials 20
-            --objective-mode aggregate_tch_sum
+            --objective-mode aggregate_metric_tons
             --aggregate-penalty 1.5
         )
         ;;
@@ -194,23 +329,37 @@ fi
 
 COMMON_ARGS=(
     --dataset-type feature_table
-    --model-type catboost
-    --categorical-mode native
-    --one-hot-features false
+    --model-type "$MODEL_TYPE"
+    --target-mode "$TARGET_MODE"
+    --categorical-mode "$CATEGORICAL_MODE"
+    --one-hot-features "$ONE_HOT_FEATURES"
     --light-features false
-    --quantiles true
-    --shap true
+    --quantiles "$QUANTILES"
+    --walk-forward-quantiles "$WALK_FORWARD_QUANTILES"
+    --shap "$SHAP"
     --diagnostics true
     --train-zafras "$TRAIN_ZAFRAS"
     --evaluation-zafras "$EVALUATION_ZAFRAS"
     --scoring-zafras "$SCORING_ZAFRAS"
+    --weight-mode "$WEIGHT_MODE"
+    --weight-max-multiplier "$WEIGHT_MAX_MULTIPLIER"
+    --weight-density-bin-width "$WEIGHT_DENSITY_BIN_WIDTH"
+    --high-yield-penalty "$HIGH_YIELD_PENALTY"
+    --worst-estrato-penalty "$WORST_ESTRATO_PENALTY"
+    --search-profile "$SEARCH_PROFILE"
 )
+if [[ -n "$FIXED_PARAMS_JSON" ]]; then
+    COMMON_ARGS+=(--fixed-params-json "$FIXED_PARAMS_JSON")
+fi
 if [[ -n "$EXCLUDE_FEATURES" ]]; then
     COMMON_ARGS+=(--exclude-features "$EXCLUDE_FEATURES")
 fi
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RUN_ID="tch-${DATASET//_/-}-${STAGE}-${TIMESTAMP}"
+TARGET_MODE_SLUG="${TARGET_MODE//_/-}"
+MODEL_TYPE_SLUG="${MODEL_TYPE//_/-}"
+WEIGHT_MODE_SLUG="${WEIGHT_MODE//_/-}"
+RUN_ID="tch-${DATASET//_/-}-${TARGET_MODE_SLUG}-${MODEL_TYPE_SLUG}-${WEIGHT_MODE_SLUG}-${STAGE}-${TIMESTAMP}"
 DATASET_DIR="$WORK_ROOT/datasets"
 DATASET_PATH="$DATASET_DIR/$DATASET.parquet"
 DATASET_PARTS_DIR="$DATASET_DIR/$DATASET"
@@ -263,12 +412,19 @@ DOCKER_COMMAND=(
     --memory "$MEMORY"
     --memory-swap "$MEMORY"
     --shm-size "$SHM_SIZE"
+    --workdir /tmp
     --label "tch.run_id=$RUN_ID"
     --label "tch.stage=$STAGE"
     --label "tch.dataset=$DATASET"
     -v "$INPUT_DIR:/opt/ml/input/data/train:ro"
     -v "$OUTPUT_DIR:/opt/ml/output/data"
     -v "$MODEL_DIR:/opt/ml/model"
+)
+if [[ -n "$CODE_DIR" ]]; then
+    [[ -d "$CODE_DIR" ]] || die "Code directory does not exist: $CODE_DIR"
+    DOCKER_COMMAND+=(-v "$CODE_DIR:/opt/ml/code:ro")
+fi
+DOCKER_COMMAND+=(
     "$IMAGE"
     "${COMMON_ARGS[@]}"
     "${STAGE_ARGS[@]}"
@@ -281,11 +437,23 @@ Stage:           $STAGE
 Dataset:         $DATASET_S3_URI
 Image:           $IMAGE
 Resources:       cpus=$CPUS memory=$MEMORY shm=$SHM_SIZE
+Code override:   ${CODE_DIR:-<image contents>}
 Local run dir:   $RUN_DIR
 Artifact target: $OUTPUT_S3_URI
 Max runtime:     $MAX_RUNTIME_SECONDS seconds
 Excluded:        ${EXCLUDE_FEATURES:-<none>}
 Aggregate pen.:  ${AGGREGATE_PENALTY:-<stage default>}
+Target mode:     $TARGET_MODE
+Model type:      $MODEL_TYPE
+Search profile:  $SEARCH_PROFILE
+Quantiles:       $QUANTILES
+SHAP:            $SHAP
+Weight mode:     $WEIGHT_MODE
+Weight cap:      $WEIGHT_MAX_MULTIPLIER
+Density bin:     $WEIGHT_DENSITY_BIN_WIDTH
+Objective extra: high_yield=$HIGH_YIELD_PENALTY worst_estrato=$WORST_ESTRATO_PENALTY
+Fixed params:    ${FIXED_PARAMS_JSON:-<none>}
+Fixed file:      ${FIXED_PARAMS_FILE:-<none>}
 Partitioned:     $PARTITIONED
 EOF
     printf 'Container command:'
@@ -350,7 +518,11 @@ fi
 IMAGE_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
 IMAGE_DIGEST="$(docker image inspect "$IMAGE" --format '{{join .RepoDigests ","}}')"
 GIT_COMMIT="$(git -C "$(dirname "$0")/.." rev-parse HEAD 2>/dev/null || echo unknown)"
-GIT_DIRTY="$(git -C "$(dirname "$0")/.." status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+if git -C "$(dirname "$0")/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    GIT_DIRTY="$(git -C "$(dirname "$0")/.." status --porcelain | wc -l | tr -d ' ')"
+else
+    GIT_DIRTY="unknown"
+fi
 
 printf '%q ' "${DOCKER_COMMAND[@]}" >"$RUN_DIR/container_command.txt"
 printf '\n' >>"$RUN_DIR/container_command.txt"
@@ -359,6 +531,10 @@ export RUN_ID STAGE DATASET DATASET_S3_URI IMAGE IMAGE_ID IMAGE_DIGEST
 export CPUS MEMORY SHM_SIZE OUTPUT_S3_URI GIT_COMMIT GIT_DIRTY
 export TRAIN_ZAFRAS EVALUATION_ZAFRAS SCORING_ZAFRAS EXCLUDE_FEATURES
 export PARTITIONED AGGREGATE_PENALTY
+export TARGET_MODE MODEL_TYPE CODE_DIR WEIGHT_MODE WEIGHT_MAX_MULTIPLIER
+export WEIGHT_DENSITY_BIN_WIDTH HIGH_YIELD_PENALTY WORST_ESTRATO_PENALTY
+export FIXED_PARAMS_JSON
+export FIXED_PARAMS_FILE SEARCH_PROFILE QUANTILES SHAP
 python3 - "$RUN_DIR/run_manifest.json" <<'PY'
 import json
 import os
@@ -370,7 +546,10 @@ keys = [
     "IMAGE_DIGEST", "CPUS", "MEMORY", "SHM_SIZE", "OUTPUT_S3_URI",
     "GIT_COMMIT", "GIT_DIRTY", "TRAIN_ZAFRAS", "EVALUATION_ZAFRAS",
     "SCORING_ZAFRAS", "EXCLUDE_FEATURES",
-    "PARTITIONED", "AGGREGATE_PENALTY",
+    "PARTITIONED", "AGGREGATE_PENALTY", "TARGET_MODE", "MODEL_TYPE", "CODE_DIR",
+    "WEIGHT_MODE", "WEIGHT_MAX_MULTIPLIER", "WEIGHT_DENSITY_BIN_WIDTH",
+    "HIGH_YIELD_PENALTY", "WORST_ESTRATO_PENALTY", "FIXED_PARAMS_JSON",
+    "FIXED_PARAMS_FILE", "SEARCH_PROFILE", "QUANTILES", "SHAP",
 ]
 payload = {key.lower(): os.environ.get(key, "") for key in keys}
 payload["host"] = {

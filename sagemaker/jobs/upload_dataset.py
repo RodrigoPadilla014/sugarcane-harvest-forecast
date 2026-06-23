@@ -24,15 +24,7 @@ load_dotenv(ROOT / "credentials" / ".env")
 BUCKET = "ndvi-extraction"
 QUERIES_DIR = ROOT / "queries"
 QUERY_SEARCH_DIRS = [
-    QUERIES_DIR / "active" / "v9" / "dataset",
-    QUERIES_DIR / "active" / "v8" / "dataset",
-    QUERIES_DIR / "active" / "v7" / "dataset",
-    QUERIES_DIR / "archive" / "v6" / "asof_180" / "dataset",
-    QUERIES_DIR / "archive" / "v5" / "asof_180" / "dataset",
-    *[
-        QUERIES_DIR / "templates" / "raw_longitudinal" / version
-        for version in ("v5", "v4", "v3", "v2")
-    ],
+    QUERIES_DIR / "active" / "v10" / "dataset",
     QUERIES_DIR,
 ]
 INCLUDE_PATTERN = re.compile(r"\{\{\s*include:([A-Za-z0-9_.-]+)\s*\}\}")

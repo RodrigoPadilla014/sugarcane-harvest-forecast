@@ -1,6 +1,6 @@
--- tch_v9_productivity_snapshot_spine.sql
+-- tch_v10_productivity_snapshot_spine.sql
 --
--- Minimal temporal spine for v9.
+-- Minimal temporal spine for v10.
 --
 -- Principles:
 --   * productividad defines historical lot validity and target TCH;
@@ -10,6 +10,8 @@
 --   * scoring uses every valid 2025_2026 lot as a 2026_2027 candidate;
 --   * scoring eligibility begins at 180 observed days and is capped at 340 days;
 --   * no recursive projection of older lots.
+--   * historical productividad features are lagged by zafra and never use the
+--     target zafra itself.
 --
 -- This is a cycle/snapshot spine. Feature aggregation is intentionally deferred
 -- until the temporal diagnostics have been reviewed.
@@ -37,6 +39,7 @@ prod_clean AS (
         p.familia_de_suelo AS prod_familia_de_suelo,
         p.variedad AS prod_variedad,
         p.no_corte AS prod_no_corte,
+        p.estrato AS prod_estrato,
         CASE
             WHEN p.cierre::text ~ '^\d{4}-\d{2}-\d{2}$'
             THEN to_date(p.cierre::text, 'YYYY-MM-DD')
@@ -120,7 +123,8 @@ historical_cycles AS (
         p.prod_codigo_zae,
         p.prod_familia_de_suelo,
         p.prod_variedad,
-        p.prod_no_corte
+        p.prod_no_corte,
+        p.prod_estrato
     FROM prod_windows p
     WHERE p.zafra_norm BETWEEN '2020_2021' AND '2025_2026'
 ),
@@ -184,6 +188,7 @@ scoring_cycles AS (
         p.prod_familia_de_suelo,
         p.prod_variedad,
         p.prod_no_corte,
+        p.prod_estrato,
         d.latest_source_date
     FROM latest_2025_2026 p
     CROSS JOIN source_dates d
@@ -211,6 +216,7 @@ scoring_snapshots AS (
         c.prod_familia_de_suelo,
         c.prod_variedad,
         c.prod_no_corte,
+        c.prod_estrato,
         'current_scoring'::text AS snapshot_type,
         least(
             340,
@@ -228,6 +234,123 @@ scoring_snapshots AS (
     FROM scoring_cycles c
 )
 ,
+history_target_keys AS (
+    SELECT DISTINCT cod_cg, zafra_norm
+    FROM historical_snapshots
+    UNION
+    SELECT DISTINCT cod_cg, zafra_norm
+    FROM historical_below_minimum
+    UNION
+    SELECT DISTINCT cod_cg, zafra_norm
+    FROM scoring_snapshots
+),
+history_ranked AS (
+    SELECT
+        t.cod_cg,
+        t.zafra_norm,
+        h.zafra_norm AS hist_zafra_norm,
+        h.tch AS hist_tch,
+        h.area AS hist_area,
+        h.tc AS hist_tc,
+        h.fecha_cierre_real AS hist_fecha_cierre_real,
+        h.prod_edad_meses AS hist_edad_meses,
+        h.prod_no_corte AS hist_no_corte,
+        h.prod_estrato AS hist_estrato,
+        h.prod_ingenio AS hist_ingenio,
+        row_number() OVER (
+            PARTITION BY t.cod_cg, t.zafra_norm
+            ORDER BY h.zafra_norm DESC, h.fecha_cierre_real DESC
+        ) AS hist_rank
+    FROM history_target_keys t
+    LEFT JOIN prod_unique h
+      ON h.cod_cg = t.cod_cg
+     AND h.zafra_norm < t.zafra_norm
+),
+history_features AS (
+    SELECT
+        cod_cg,
+        zafra_norm,
+        max(hist_zafra_norm) FILTER (WHERE hist_rank = 1) AS last_hist_zafra_norm,
+        max(hist_tch) FILTER (WHERE hist_rank = 1) AS last_hist_tch,
+        max(hist_area) FILTER (WHERE hist_rank = 1) AS last_hist_area,
+        max(hist_tc) FILTER (WHERE hist_rank = 1) AS last_hist_tc,
+        max(hist_fecha_cierre_real) FILTER (WHERE hist_rank = 1) AS last_hist_fecha_cierre_real,
+        max(hist_edad_meses) FILTER (WHERE hist_rank = 1) AS last_hist_edad_meses,
+        max(hist_no_corte) FILTER (WHERE hist_rank = 1) AS last_hist_no_corte,
+        max(hist_estrato) FILTER (WHERE hist_rank = 1) AS last_hist_estrato,
+        max(hist_ingenio) FILTER (WHERE hist_rank = 1) AS last_hist_ingenio,
+        count(hist_tch)::double precision AS hist_tch_count_available,
+        avg(hist_tch) FILTER (WHERE hist_rank <= 2) AS hist_tch_mean_last2,
+        avg(hist_tch) FILTER (WHERE hist_rank <= 3) AS hist_tch_mean_last3,
+        stddev_samp(hist_tch) FILTER (WHERE hist_rank <= 3) AS hist_tch_std_last3,
+        min(hist_tch) FILTER (WHERE hist_rank <= 3) AS hist_tch_min_last3,
+        max(hist_tch) FILTER (WHERE hist_rank <= 3) AS hist_tch_max_last3,
+        (
+            max(hist_tch) FILTER (WHERE hist_rank = 1)
+            - max(hist_tch) FILTER (WHERE hist_rank = 2)
+        ) AS hist_tch_trend_last2,
+        (max(hist_tch) FILTER (WHERE hist_rank = 1) IS NOT NULL)::integer
+            AS has_last_hist_tch,
+        (count(hist_tch) >= 2)::integer AS has_hist_2plus,
+        (count(hist_tch) >= 3)::integer AS has_hist_3plus,
+        (
+            max(hist_zafra_norm) FILTER (WHERE hist_rank = 1)
+            = (
+                (split_part(zafra_norm, '_', 1)::integer - 1)::text
+                || '_' || split_part(zafra_norm, '_', 1)
+            )
+        )::integer AS has_immediate_previous_zafra
+    FROM history_ranked
+    GROUP BY cod_cg, zafra_norm
+),
+history_estrato_means AS (
+    SELECT
+        zafra_norm,
+        prod_estrato,
+        avg(tch) AS estrato_zafra_tch_mean
+    FROM prod_unique
+    GROUP BY zafra_norm, prod_estrato
+),
+history_ingenio_means AS (
+    SELECT
+        zafra_norm,
+        prod_ingenio,
+        avg(tch) AS ingenio_zafra_tch_mean
+    FROM prod_unique
+    GROUP BY zafra_norm, prod_ingenio
+),
+history_group_means AS (
+    SELECT
+        h.cod_cg,
+        h.zafra_norm,
+        e.estrato_zafra_tch_mean AS last_hist_estrato_zafra_tch_mean,
+        i.ingenio_zafra_tch_mean AS last_hist_ingenio_zafra_tch_mean
+    FROM history_features h
+    LEFT JOIN history_estrato_means e
+      ON e.zafra_norm = h.last_hist_zafra_norm
+     AND e.prod_estrato = h.last_hist_estrato
+    LEFT JOIN history_ingenio_means i
+      ON i.zafra_norm = h.last_hist_zafra_norm
+     AND i.prod_ingenio = h.last_hist_ingenio
+),
+history_features_enriched AS (
+    SELECT
+        h.*,
+        g.last_hist_estrato_zafra_tch_mean,
+        g.last_hist_ingenio_zafra_tch_mean,
+        h.last_hist_tch - g.last_hist_estrato_zafra_tch_mean
+            AS last_hist_tch_minus_estrato_zafra_mean,
+        h.last_hist_tch - g.last_hist_ingenio_zafra_tch_mean
+            AS last_hist_tch_minus_ingenio_zafra_mean,
+        h.last_hist_tch / NULLIF(g.last_hist_estrato_zafra_tch_mean, 0)
+            AS last_hist_tch_ratio_estrato_zafra_mean,
+        h.last_hist_tch / NULLIF(g.last_hist_ingenio_zafra_tch_mean, 0)
+            AS last_hist_tch_ratio_ingenio_zafra_mean
+    FROM history_features h
+    LEFT JOIN history_group_means g
+      ON g.cod_cg = h.cod_cg
+     AND g.zafra_norm = h.zafra_norm
+),
 snapshot_spine AS (
     SELECT * FROM historical_snapshots
     UNION ALL
@@ -238,5 +361,34 @@ snapshot_spine AS (
 SELECT
     (cycle_id || '_d' || snapshot_day::text)::text AS cod_cg_zafra,
     snapshot_spine.*,
-    snapshot_day::double precision AS prediction_age_days
-FROM snapshot_spine;
+    snapshot_day::double precision AS prediction_age_days,
+    h.last_hist_zafra_norm,
+    h.last_hist_tch,
+    h.last_hist_area,
+    h.last_hist_tc,
+    h.last_hist_fecha_cierre_real,
+    h.last_hist_edad_meses,
+    h.last_hist_no_corte,
+    h.last_hist_estrato,
+    h.last_hist_ingenio,
+    h.hist_tch_count_available,
+    h.hist_tch_mean_last2,
+    h.hist_tch_mean_last3,
+    h.hist_tch_std_last3,
+    h.hist_tch_min_last3,
+    h.hist_tch_max_last3,
+    h.hist_tch_trend_last2,
+    h.has_last_hist_tch,
+    h.has_hist_2plus,
+    h.has_hist_3plus,
+    h.has_immediate_previous_zafra,
+    h.last_hist_estrato_zafra_tch_mean,
+    h.last_hist_ingenio_zafra_tch_mean,
+    h.last_hist_tch_minus_estrato_zafra_mean,
+    h.last_hist_tch_minus_ingenio_zafra_mean,
+    h.last_hist_tch_ratio_estrato_zafra_mean,
+    h.last_hist_tch_ratio_ingenio_zafra_mean
+FROM snapshot_spine
+LEFT JOIN history_features_enriched h
+  ON h.cod_cg = snapshot_spine.cod_cg
+ AND h.zafra_norm = snapshot_spine.zafra_norm;

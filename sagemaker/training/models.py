@@ -23,7 +23,11 @@ def build_model(model_type: str, params: dict):
     raise ValueError(f"Unknown model type: {model_type}")
 
 
-def suggest_params(trial: optuna.Trial, model_type: str) -> dict:
+def suggest_params(
+    trial: optuna.Trial,
+    model_type: str,
+    search_profile: str = "default",
+) -> dict:
     if model_type == "xgboost":
         return {
             "n_estimators": trial.suggest_int("n_estimators", 200, 1200),
@@ -48,6 +52,25 @@ def suggest_params(trial: optuna.Trial, model_type: str) -> dict:
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 20.0, log=True),
         }
     if model_type == "catboost":
+        if search_profile == "phase4_catboost":
+            grow_policy = trial.suggest_categorical(
+                "grow_policy",
+                ["SymmetricTree", "Depthwise"],
+            )
+            params = {
+                "iterations": trial.suggest_int("iterations", 600, 1600),
+                "depth": trial.suggest_int("depth", 4, 9),
+                "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.12, log=True),
+                "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 0.1, 40.0, log=True),
+                "random_strength": trial.suggest_float("random_strength", 0.01, 15.0, log=True),
+                "grow_policy": grow_policy,
+                "loss_function": "RMSE",
+            }
+            if grow_policy == "Depthwise":
+                params["min_data_in_leaf"] = trial.suggest_int(
+                    "min_data_in_leaf", 5, 80, log=True
+                )
+            return params
         return {
             "iterations": trial.suggest_int("iterations", 300, 800),
             "depth": trial.suggest_int("depth", 3, 10),

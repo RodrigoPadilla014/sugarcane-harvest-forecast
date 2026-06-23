@@ -1,11 +1,11 @@
--- tch_features_v9_productivity_snapshots.sql
+-- tch_features_v10_productivity_history_snapshots.sql
 --
--- Snapshot-aware v9 feature table. Productividad defines historical validity;
+-- Snapshot-aware v10 feature table. Productividad defines historical validity;
 -- observations are aligned only by lot and date.
 
 WITH
 spine AS (
-{{ include:tch_v9_productivity_snapshot_spine }}
+{{ include:tch_v10_productivity_snapshot_spine }}
 ),
 optical_long AS (
     SELECT

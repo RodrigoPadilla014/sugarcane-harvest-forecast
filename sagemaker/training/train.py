@@ -30,6 +30,8 @@ from categorical_encoding import (
 from feature_diagnostics import save_feature_diagnostics
 from features import build_dataset
 from metrics import (
+    estrato_metrics,
+    future_scoring_estrato_metrics,
     lot_error_metrics,
     lot_predictions,
     aggregate_zafra_metrics,
@@ -44,10 +46,20 @@ from metrics import (
 from models import build_model, suggest_params
 from shap_utils import save_shap_values
 from splits import indexes_for_zafras, walk_forward_splits
+from weighting import (
+    WEIGHT_MODES,
+    sample_weights_for_index,
+    training_weights_for_index,
+    weight_diagnostics,
+)
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 QUANTILE_ALPHAS = (0.10, 0.50, 0.90)
-OBJECTIVE_MODES = {"auto", "lot_rmse", "walk_forward_r2", "aggregate_tch_sum"}
+OBJECTIVE_MODES = {"auto", "lot_rmse", "walk_forward_r2", "aggregate_tch_sum", "aggregate_metric_tons"}
+TARGET_MODES = {"absolute", "residual_last_hist_tch", "direct_metric_tons"}
+RESIDUAL_ANCHOR_FEATURE = "last_hist_tch"
+DIRECT_AREA_FEATURE = "direct_area"
+HIGH_YIELD_THRESHOLD = 115.0
 
 
 def log(message: str) -> None:
@@ -224,6 +236,77 @@ def resolve_objective_mode(objective_mode: str, walk_forward: bool) -> str:
     return objective_mode
 
 
+def model_target(y_actual: pd.Series, X: pd.DataFrame, target_mode: str) -> pd.Series:
+    if target_mode == "absolute":
+        return y_actual.copy()
+    if target_mode == "residual_last_hist_tch":
+        if RESIDUAL_ANCHOR_FEATURE not in X.columns:
+            raise ValueError(
+                f"target_mode={target_mode} requires feature {RESIDUAL_ANCHOR_FEATURE}"
+            )
+        anchor = pd.to_numeric(X[RESIDUAL_ANCHOR_FEATURE], errors="coerce")
+        missing = int(anchor.isna().sum())
+        if missing:
+            raise ValueError(
+                f"target_mode={target_mode} has {missing} rows without "
+                f"{RESIDUAL_ANCHOR_FEATURE}"
+            )
+        result = y_actual - anchor
+        result.name = f"{y_actual.name}_residual"
+        return result
+    if target_mode == "direct_metric_tons":
+        if DIRECT_AREA_FEATURE not in X.columns:
+            raise ValueError(
+                f"target_mode={target_mode} requires feature {DIRECT_AREA_FEATURE}"
+            )
+        area = pd.to_numeric(X[DIRECT_AREA_FEATURE], errors="coerce")
+        if area.isna().any() or (area <= 0).any():
+            raise ValueError(
+                f"target_mode={target_mode} requires positive, non-missing area"
+            )
+        result = y_actual * area
+        result.name = "metric_tons"
+        return result
+    raise ValueError(f"Unknown target_mode: {target_mode}")
+
+
+def reconstruct_tch_predictions(
+    raw_predictions,
+    X: pd.DataFrame,
+    target_mode: str,
+) -> np.ndarray:
+    predictions = np.asarray(raw_predictions, dtype=float)
+    if target_mode == "absolute":
+        return predictions
+    if target_mode == "residual_last_hist_tch":
+        if RESIDUAL_ANCHOR_FEATURE not in X.columns:
+            raise ValueError(
+                f"target_mode={target_mode} requires feature {RESIDUAL_ANCHOR_FEATURE}"
+            )
+        anchor = pd.to_numeric(X[RESIDUAL_ANCHOR_FEATURE], errors="coerce").to_numpy()
+        if np.isnan(anchor).any():
+            raise ValueError(
+                f"target_mode={target_mode} cannot reconstruct rows without "
+                f"{RESIDUAL_ANCHOR_FEATURE}"
+            )
+        return anchor + predictions
+    if target_mode == "direct_metric_tons":
+        if DIRECT_AREA_FEATURE not in X.columns:
+            raise ValueError(
+                f"target_mode={target_mode} requires feature {DIRECT_AREA_FEATURE}"
+            )
+        area = pd.to_numeric(
+            X[DIRECT_AREA_FEATURE],
+            errors="coerce",
+        ).to_numpy()
+        if np.isnan(area).any() or (area <= 0).any():
+            raise ValueError(
+                f"target_mode={target_mode} requires positive, non-missing area"
+            )
+        return predictions / area
+    raise ValueError(f"Unknown target_mode: {target_mode}")
+
+
 def aggregate_tch_sum_pct_diff(
     y_true: pd.Series,
     y_pred,
@@ -254,6 +337,112 @@ def aggregate_tch_sum_pct_diff(
     if actual_sum == 0:
         return 0.0
     return 100.0 * (pred_sum - actual_sum) / actual_sum
+
+
+def aggregate_metric_tons_pct_diff(
+    y_true: pd.Series,
+    y_pred,
+    metadata: pd.DataFrame | None = None,
+) -> float:
+    if metadata is None or "area" not in metadata.columns:
+        raise ValueError("aggregate_metric_tons objective requires an area column in metadata")
+
+    aligned = metadata.set_index("cod_cg_zafra").reindex(y_true.index)
+    frame_data = {
+        "area": pd.to_numeric(aligned["area"], errors="coerce").to_numpy(),
+        "actual": y_true.to_numpy(),
+        "pred": np.asarray(y_pred),
+    }
+    if "snapshot_day" in aligned.columns:
+        frame_data["snapshot_day"] = aligned["snapshot_day"].to_numpy()
+    if "zafra_norm" in aligned.columns:
+        frame_data["zafra_norm"] = aligned["zafra_norm"].to_numpy()
+    frame = pd.DataFrame(frame_data).dropna(subset=["area", "actual", "pred"])
+    if frame.empty:
+        return 0.0
+
+    def pct_diff(group: pd.DataFrame) -> float | None:
+        actual_sum = float((group["actual"] * group["area"]).sum())
+        if actual_sum == 0:
+            return None
+        pred_sum = float((group["pred"] * group["area"]).sum())
+        return 100.0 * (pred_sum - actual_sum) / actual_sum
+
+    group_cols = [col for col in ["zafra_norm", "snapshot_day"] if col in frame.columns]
+    if group_cols:
+        pct_diffs = [
+            diff
+            for _, group in frame.groupby(group_cols, dropna=False)
+            if (diff := pct_diff(group)) is not None
+        ]
+        return float(np.mean(np.abs(pct_diffs))) if pct_diffs else 0.0
+
+    diff = pct_diff(frame)
+    return float(diff) if diff is not None else 0.0
+
+
+def high_yield_area_weighted_abs_bias(
+    y_true: pd.Series,
+    y_pred,
+    metadata: pd.DataFrame,
+    threshold: float = HIGH_YIELD_THRESHOLD,
+) -> float:
+    aligned = metadata.set_index("cod_cg_zafra").reindex(y_true.index)
+    frame = pd.DataFrame(
+        {
+            "area": pd.to_numeric(aligned["area"], errors="coerce").to_numpy(),
+            "actual": y_true.to_numpy(),
+            "pred": np.asarray(y_pred),
+        }
+    ).dropna()
+    frame = frame[frame["actual"] > threshold]
+    if frame.empty or float(frame["area"].sum()) == 0:
+        return 0.0
+    return float(
+        abs(np.average(frame["pred"] - frame["actual"], weights=frame["area"]))
+    )
+
+
+def worst_estrato_metric_tons_abs_pct_error(
+    y_true: pd.Series,
+    y_pred,
+    metadata: pd.DataFrame,
+) -> float:
+    aligned = metadata.set_index("cod_cg_zafra").reindex(y_true.index)
+    if "prod_estrato" not in aligned.columns:
+        return 0.0
+    frame = pd.DataFrame(
+        {
+            "estrato": aligned["prod_estrato"].fillna("<sin estrato>").to_numpy(),
+            "area": pd.to_numeric(aligned["area"], errors="coerce").to_numpy(),
+            "actual": y_true.to_numpy(),
+            "pred": np.asarray(y_pred),
+        }
+    ).dropna(subset=["area", "actual", "pred"])
+    errors = []
+    for _, group in frame.groupby("estrato", dropna=False):
+        actual_tm = float((group["actual"] * group["area"]).sum())
+        if actual_tm:
+            pred_tm = float((group["pred"] * group["area"]).sum())
+            errors.append(abs(100.0 * (pred_tm - actual_tm) / actual_tm))
+    return float(max(errors)) if errors else 0.0
+
+
+def composite_metric_tons_objective(
+    rmse: float,
+    abs_metric_tons_pct_diff: float,
+    aggregate_penalty: float,
+    high_yield_abs_bias: float = 0.0,
+    high_yield_penalty: float = 0.0,
+    worst_estrato_abs_pct_error: float = 0.0,
+    worst_estrato_penalty: float = 0.0,
+) -> float:
+    return float(
+        rmse
+        + aggregate_penalty * abs_metric_tons_pct_diff
+        + high_yield_penalty * high_yield_abs_bias
+        + worst_estrato_penalty * worst_estrato_abs_pct_error
+    )
 
 
 def load_parquet_dir(data_dir: str) -> pd.DataFrame:
@@ -292,22 +481,6 @@ def prepare_features_for_model(
         validate_categorical_mode_for_model(categorical_mode, model_type)
         return X.copy()
     return X.apply(pd.to_numeric, errors="coerce")
-
-
-def sample_weights_for_index(
-    metadata: pd.DataFrame,
-    index: pd.Index,
-) -> pd.Series | None:
-    if "snapshot_weight" not in metadata.columns:
-        return None
-    weights = (
-        metadata.set_index("cod_cg_zafra")["snapshot_weight"]
-        .reindex(index)
-        .astype(float)
-    )
-    if weights.isna().any():
-        raise ValueError("snapshot_weight is missing for one or more model rows")
-    return weights
 
 
 def fit_model(
@@ -412,18 +585,29 @@ def predict_quantiles(
     y: pd.Series,
     metadata: pd.DataFrame,
     split: str,
+    target_mode: str = "absolute",
 ) -> pd.DataFrame:
     df = metadata.set_index("cod_cg_zafra").loc[y.index].copy()
     df.index.name = "cod_cg_zafra"
     df = df.reset_index()
     df["split"] = split
     df["actual_tch"] = y.to_numpy()
+    if RESIDUAL_ANCHOR_FEATURE in X.columns:
+        df[RESIDUAL_ANCHOR_FEATURE] = pd.to_numeric(
+            X[RESIDUAL_ANCHOR_FEATURE],
+            errors="coerce",
+        ).to_numpy()
     for alpha in QUANTILE_ALPHAS:
         percentile = int(round(alpha * 100))
         if model_type == "random_forest":
-            df[f"pred_tch_p{percentile}"] = random_forest_quantile_predictions(base_model, X, alpha)
+            raw_pred = random_forest_quantile_predictions(base_model, X, alpha)
         else:
-            df[f"pred_tch_p{percentile}"] = quantile_models[alpha].predict(X)
+            raw_pred = quantile_models[alpha].predict(X)
+        df[f"pred_tch_p{percentile}"] = reconstruct_tch_predictions(
+            raw_pred,
+            X,
+            target_mode,
+        )
 
     ordered_cols = [
         "split",
@@ -448,12 +632,22 @@ def future_scoring_predictions(
     quantile_models: dict,
     X: pd.DataFrame,
     metadata: pd.DataFrame,
+    target_mode: str = "absolute",
 ) -> pd.DataFrame:
     df = metadata.set_index("cod_cg_zafra").loc[X.index].copy()
     df.index.name = "cod_cg_zafra"
     df = df.reset_index()
     df["split"] = "future_scoring"
-    df["pred_tch"] = model.predict(X)
+    if RESIDUAL_ANCHOR_FEATURE in X.columns:
+        df[RESIDUAL_ANCHOR_FEATURE] = pd.to_numeric(
+            X[RESIDUAL_ANCHOR_FEATURE],
+            errors="coerce",
+        ).to_numpy()
+    df["pred_tch"] = reconstruct_tch_predictions(
+        model.predict(X),
+        X,
+        target_mode,
+    )
 
     if quantile_models or model_type == "random_forest":
         for alpha in QUANTILE_ALPHAS:
@@ -462,7 +656,11 @@ def future_scoring_predictions(
                 pred = random_forest_quantile_predictions(model, X, alpha)
             else:
                 pred = quantile_models[alpha].predict(X)
-            df[f"pred_tch_p{percentile}"] = pred
+            df[f"pred_tch_p{percentile}"] = reconstruct_tch_predictions(
+                pred,
+                X,
+                target_mode,
+            )
 
     ordered_cols = [
         "split",
@@ -505,17 +703,23 @@ def summarize_future_scoring(predictions: pd.DataFrame) -> pd.DataFrame:
         col = f"pred_tch_p{percentile}"
         if col in predictions.columns:
             aggregations[f"{col}_sum"] = (col, "sum")
+            if "area" in predictions.columns:
+                area_col = f"pred_area_weighted_tch_p{percentile}"
+                predictions[area_col] = predictions[col] * predictions["area"]
+                aggregations[f"{area_col}_sum"] = (area_col, "sum")
 
     return predictions.groupby("zafra_norm", dropna=False).agg(**aggregations).reset_index()
 
 
 def fit_with_optuna(
     X_train: pd.DataFrame,
-    y_train: pd.Series,
+    y_train_model: pd.Series,
+    y_train_actual: pd.Series,
     X_validation: pd.DataFrame,
-    y_validation: pd.Series,
+    y_validation_actual: pd.Series,
     X: pd.DataFrame,
-    y: pd.Series,
+    y_model: pd.Series,
+    y_actual: pd.Series,
     metadata: pd.DataFrame,
     model_type: str,
     n_trials: int,
@@ -525,17 +729,27 @@ def fit_with_optuna(
     objective_mode: str,
     aggregate_penalty: float,
     walk_forward_zafras: list[str],
+    target_mode: str,
+    weight_mode: str,
+    weight_max_multiplier: float,
+    weight_density_bin_width: float,
+    high_yield_penalty: float,
+    worst_estrato_penalty: float,
+    search_profile: str,
 ):
     walk_forward_folds = walk_forward_splits(metadata, walk_forward_zafras) if walk_forward else []
     resolved_objective_mode = resolve_objective_mode(objective_mode, walk_forward)
 
     def objective(trial):
-        params = suggest_params(trial, model_type)
+        params = suggest_params(trial, model_type, search_profile=search_profile)
 
         if walk_forward:
             fold_scores = []
             fold_rmses = []
             fold_aggregate_pct_diffs = []
+            fold_metric_tons_pct_diffs = []
+            fold_high_yield_biases = []
+            fold_worst_estrato_pct_errors = []
             for validation_zafra, train_idx, validation_idx in walk_forward_folds:
                 train_idx = train_idx.intersection(X.index)
                 validation_idx = validation_idx.intersection(X.index)
@@ -547,13 +761,26 @@ def fit_with_optuna(
                     model,
                     model_type,
                     X.loc[train_idx],
-                    y.loc[train_idx],
+                    y_model.loc[train_idx],
                     categorical_mode,
-                    sample_weight=sample_weights_for_index(metadata, train_idx),
+                    sample_weight=training_weights_for_index(
+                        metadata,
+                        y_actual,
+                        X,
+                        train_idx,
+                        train_idx,
+                        mode=weight_mode,
+                        max_multiplier=weight_max_multiplier,
+                        density_bin_width=weight_density_bin_width,
+                    ),
                 )
-                pred = model.predict(X.loc[validation_idx])
+                pred = reconstruct_tch_predictions(
+                    model.predict(X.loc[validation_idx]),
+                    X.loc[validation_idx],
+                    target_mode,
+                )
                 fold_metrics = regression_metrics(
-                    y.loc[validation_idx],
+                    y_actual.loc[validation_idx],
                     pred,
                     sample_weight=sample_weights_for_index(
                         metadata,
@@ -564,7 +791,28 @@ def fit_with_optuna(
                 fold_rmses.append(fold_metrics["rmse"])
                 fold_aggregate_pct_diffs.append(
                     aggregate_tch_sum_pct_diff(
-                        y.loc[validation_idx],
+                        y_actual.loc[validation_idx],
+                        pred,
+                        metadata,
+                    )
+                )
+                fold_metric_tons_pct_diffs.append(
+                    aggregate_metric_tons_pct_diff(
+                        y_actual.loc[validation_idx],
+                        pred,
+                        metadata,
+                    )
+                )
+                fold_high_yield_biases.append(
+                    high_yield_area_weighted_abs_bias(
+                        y_actual.loc[validation_idx],
+                        pred,
+                        metadata,
+                    )
+                )
+                fold_worst_estrato_pct_errors.append(
+                    worst_estrato_metric_tons_abs_pct_error(
+                        y_actual.loc[validation_idx],
                         pred,
                         metadata,
                     )
@@ -577,15 +825,43 @@ def fit_with_optuna(
             std_r2 = float(np.std(fold_scores))
             mean_rmse = float(np.mean(fold_rmses))
             mean_abs_aggregate_pct_diff = float(np.mean(np.abs(fold_aggregate_pct_diffs)))
+            mean_abs_metric_tons_pct_diff = float(np.mean(np.abs(fold_metric_tons_pct_diffs)))
+            mean_high_yield_abs_bias = float(np.mean(fold_high_yield_biases))
+            mean_worst_estrato_abs_pct_error = float(
+                np.mean(fold_worst_estrato_pct_errors)
+            )
             trial.set_user_attr("fold_r2", fold_scores)
             trial.set_user_attr("fold_rmse", fold_rmses)
             trial.set_user_attr("fold_aggregate_tch_sum_pct_diff", fold_aggregate_pct_diffs)
+            trial.set_user_attr("fold_aggregate_metric_tons_pct_diff", fold_metric_tons_pct_diffs)
+            trial.set_user_attr("fold_high_yield_abs_bias", fold_high_yield_biases)
+            trial.set_user_attr(
+                "fold_worst_estrato_abs_pct_error",
+                fold_worst_estrato_pct_errors,
+            )
             trial.set_user_attr("mean_r2", mean_r2)
             trial.set_user_attr("std_r2", std_r2)
             trial.set_user_attr("mean_rmse", mean_rmse)
             trial.set_user_attr("mean_abs_aggregate_tch_sum_pct_diff", mean_abs_aggregate_pct_diff)
+            trial.set_user_attr("mean_abs_aggregate_metric_tons_pct_diff", mean_abs_metric_tons_pct_diff)
+            trial.set_user_attr("mean_high_yield_abs_bias", mean_high_yield_abs_bias)
+            trial.set_user_attr(
+                "mean_worst_estrato_abs_pct_error",
+                mean_worst_estrato_abs_pct_error,
+            )
             if resolved_objective_mode == "aggregate_tch_sum":
                 return mean_rmse + aggregate_penalty * mean_abs_aggregate_pct_diff
+            if resolved_objective_mode == "aggregate_metric_tons":
+                return composite_metric_tons_objective(
+                    mean_rmse
+                    ,
+                    mean_abs_metric_tons_pct_diff,
+                    aggregate_penalty,
+                    mean_high_yield_abs_bias,
+                    high_yield_penalty,
+                    mean_worst_estrato_abs_pct_error,
+                    worst_estrato_penalty,
+                )
             return mean_r2 - stability_penalty * std_r2
 
         model = build_estimator(model_type, params)
@@ -593,47 +869,104 @@ def fit_with_optuna(
             model,
             model_type,
             X_train,
-            y_train,
+            y_train_model,
             categorical_mode,
-            sample_weight=sample_weights_for_index(metadata, X_train.index),
+            sample_weight=training_weights_for_index(
+                metadata,
+                y_train_actual,
+                X,
+                X_train.index,
+                X_train.index,
+                mode=weight_mode,
+                max_multiplier=weight_max_multiplier,
+                density_bin_width=weight_density_bin_width,
+            ),
         )
-        pred = model.predict(X_validation)
+        pred = reconstruct_tch_predictions(
+            model.predict(X_validation),
+            X_validation,
+            target_mode,
+        )
         rmse = regression_metrics(
-            y_validation,
+            y_validation_actual,
             pred,
             sample_weight=sample_weights_for_index(
                 metadata,
-                y_validation.index,
+                y_validation_actual.index,
             ),
         )["rmse"]
         aggregate_pct_diff = aggregate_tch_sum_pct_diff(
-            y_validation,
+            y_validation_actual,
+            pred,
+            metadata,
+        )
+        metric_tons_pct_diff = aggregate_metric_tons_pct_diff(
+            y_validation_actual,
+            pred,
+            metadata,
+        )
+        high_yield_abs_bias = high_yield_area_weighted_abs_bias(
+            y_validation_actual,
+            pred,
+            metadata,
+        )
+        worst_estrato_abs_pct_error = worst_estrato_metric_tons_abs_pct_error(
+            y_validation_actual,
             pred,
             metadata,
         )
         trial.set_user_attr("rmse", float(rmse))
         trial.set_user_attr("aggregate_tch_sum_pct_diff", float(aggregate_pct_diff))
         trial.set_user_attr("abs_aggregate_tch_sum_pct_diff", float(abs(aggregate_pct_diff)))
+        trial.set_user_attr("aggregate_metric_tons_pct_diff", float(metric_tons_pct_diff))
+        trial.set_user_attr("abs_aggregate_metric_tons_pct_diff", float(abs(metric_tons_pct_diff)))
+        trial.set_user_attr("high_yield_abs_bias", float(high_yield_abs_bias))
+        trial.set_user_attr(
+            "worst_estrato_abs_pct_error",
+            float(worst_estrato_abs_pct_error),
+        )
         if resolved_objective_mode == "aggregate_tch_sum":
             return rmse + aggregate_penalty * abs(aggregate_pct_diff)
+        if resolved_objective_mode == "aggregate_metric_tons":
+            return composite_metric_tons_objective(
+                rmse
+                ,
+                abs(metric_tons_pct_diff),
+                aggregate_penalty,
+                high_yield_abs_bias,
+                high_yield_penalty,
+                worst_estrato_abs_pct_error,
+                worst_estrato_penalty,
+            )
         return rmse
 
     def trial_callback(study: optuna.Study, trial: optuna.trial.FrozenTrial) -> None:
-        if resolved_objective_mode == "aggregate_tch_sum":
+        if resolved_objective_mode in {"aggregate_tch_sum", "aggregate_metric_tons"}:
+            metric_label = "metric_tons" if resolved_objective_mode == "aggregate_metric_tons" else "tch_sum"
             if walk_forward:
                 mean_rmse = trial.user_attrs.get("mean_rmse")
-                mean_abs_agg = trial.user_attrs.get("mean_abs_aggregate_tch_sum_pct_diff")
+                attr = (
+                    "mean_abs_aggregate_metric_tons_pct_diff"
+                    if resolved_objective_mode == "aggregate_metric_tons"
+                    else "mean_abs_aggregate_tch_sum_pct_diff"
+                )
+                mean_abs_agg = trial.user_attrs.get(attr)
                 log(
                     f"Trial {trial.number + 1}/{n_trials} | aggregate_score={trial.value:.4f} | "
-                    f"mean_rmse={mean_rmse:.4f} | mean_abs_tch_sum_pct_diff={mean_abs_agg:.4f} | "
+                    f"mean_rmse={mean_rmse:.4f} | mean_abs_{metric_label}_pct_diff={mean_abs_agg:.4f} | "
                     f"best={study.best_value:.4f}"
                 )
             else:
                 rmse = trial.user_attrs.get("rmse")
-                abs_agg = trial.user_attrs.get("abs_aggregate_tch_sum_pct_diff")
+                attr = (
+                    "abs_aggregate_metric_tons_pct_diff"
+                    if resolved_objective_mode == "aggregate_metric_tons"
+                    else "abs_aggregate_tch_sum_pct_diff"
+                )
+                abs_agg = trial.user_attrs.get(attr)
                 log(
                     f"Trial {trial.number + 1}/{n_trials} | aggregate_score={trial.value:.4f} | "
-                    f"rmse={rmse:.4f} | abs_tch_sum_pct_diff={abs_agg:.4f} | best={study.best_value:.4f}"
+                    f"rmse={rmse:.4f} | abs_{metric_label}_pct_diff={abs_agg:.4f} | best={study.best_value:.4f}"
                 )
         elif walk_forward:
             mean_r2 = trial.user_attrs.get("mean_r2")
@@ -652,28 +985,51 @@ def fit_with_optuna(
     return study.best_params, study
 
 
-def evaluate_split(model, X: pd.DataFrame, y: pd.Series, metadata: pd.DataFrame, split: str):
-    pred = model.predict(X)
+def evaluate_split(
+    model,
+    X: pd.DataFrame,
+    y_actual: pd.Series,
+    metadata: pd.DataFrame,
+    split: str,
+    target_mode: str = "absolute",
+):
+    pred = reconstruct_tch_predictions(model.predict(X), X, target_mode)
     metrics = regression_metrics(
-        y,
+        y_actual,
         pred,
-        sample_weight=sample_weights_for_index(metadata, y.index),
+        sample_weight=sample_weights_for_index(metadata, y_actual.index),
     )
-    zafra_df = zafra_metrics(metadata, y, pred, split=split)
-    lot_df = lot_predictions(metadata, y, pred, split=split)
+    zafra_df = zafra_metrics(metadata, y_actual, pred, split=split)
+    lot_df = lot_predictions(metadata, y_actual, pred, split=split)
+    if RESIDUAL_ANCHOR_FEATURE in X.columns:
+        anchor = pd.to_numeric(
+            X.loc[y_actual.index, RESIDUAL_ANCHOR_FEATURE],
+            errors="coerce",
+        ).to_numpy()
+        lot_df[RESIDUAL_ANCHOR_FEATURE] = anchor
+        lot_df["actual_change_from_history"] = lot_df["actual_tch"] - anchor
+        lot_df["pred_change_from_history"] = lot_df["pred_tch"] - anchor
     return metrics, zafra_df, lot_df
 
 
 def run_walk_forward(
     X: pd.DataFrame,
-    y: pd.Series,
+    y_model: pd.Series,
+    y_actual: pd.Series,
     metadata: pd.DataFrame,
     model_type: str,
     params: dict,
     categorical_mode: str,
     zafras: list[str],
-) -> pd.DataFrame:
+    target_mode: str = "absolute",
+    weight_mode: str = "snapshot",
+    weight_max_multiplier: float = 1.0,
+    weight_density_bin_width: float = 5.0,
+    quantiles_enabled: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rows = []
+    prediction_frames = []
+    quantile_prediction_frames = []
     for validation_zafra, train_idx, validation_idx in walk_forward_splits(metadata, zafras):
         train_idx = train_idx.intersection(X.index)
         validation_idx = validation_idx.intersection(X.index)
@@ -681,17 +1037,31 @@ def run_walk_forward(
             continue
 
         model = build_estimator(model_type, params)
+        fold_train_weight = training_weights_for_index(
+            metadata,
+            y_actual,
+            X,
+            train_idx,
+            train_idx,
+            mode=weight_mode,
+            max_multiplier=weight_max_multiplier,
+            density_bin_width=weight_density_bin_width,
+        )
         fit_model(
             model,
             model_type,
             X.loc[train_idx],
-            y.loc[train_idx],
+            y_model.loc[train_idx],
             categorical_mode,
-            sample_weight=sample_weights_for_index(metadata, train_idx),
+            sample_weight=fold_train_weight,
         )
-        pred = model.predict(X.loc[validation_idx])
+        pred = reconstruct_tch_predictions(
+            model.predict(X.loc[validation_idx]),
+            X.loc[validation_idx],
+            target_mode,
+        )
         fold_metrics = regression_metrics(
-            y.loc[validation_idx],
+            y_actual.loc[validation_idx],
             pred,
             sample_weight=sample_weights_for_index(
                 metadata,
@@ -701,7 +1071,7 @@ def run_walk_forward(
         fold_metadata = metadata.set_index("cod_cg_zafra").reindex(validation_idx)
         has_snapshots = "snapshot_day" in fold_metadata.columns
         actual_tch_sum = (
-            np.nan if has_snapshots else float(y.loc[validation_idx].sum())
+            np.nan if has_snapshots else float(y_actual.loc[validation_idx].sum())
         )
         pred_tch_sum = np.nan if has_snapshots else float(np.sum(pred))
         tch_sum_diff = pred_tch_sum - actual_tch_sum
@@ -713,7 +1083,7 @@ def run_walk_forward(
         fold_metrics["tch_sum_diff"] = tch_sum_diff
         fold_metrics["tch_sum_pct_diff"] = (
             aggregate_tch_sum_pct_diff(
-                y.loc[validation_idx],
+                y_actual.loc[validation_idx],
                 pred,
                 metadata,
             )
@@ -725,7 +1095,61 @@ def run_walk_forward(
         )
         fold_metrics["abs_tch_sum_pct_diff"] = abs(fold_metrics["tch_sum_pct_diff"])
         rows.append(fold_metrics)
-    return pd.DataFrame(rows)
+
+        fold_predictions = lot_predictions(
+            metadata,
+            y_actual.loc[validation_idx],
+            pred,
+            split="walk_forward",
+        )
+        fold_predictions["validation_zafra"] = validation_zafra
+        if RESIDUAL_ANCHOR_FEATURE in X.columns:
+            anchor = pd.to_numeric(
+                X.loc[validation_idx, RESIDUAL_ANCHOR_FEATURE],
+                errors="coerce",
+            ).to_numpy()
+            fold_predictions[RESIDUAL_ANCHOR_FEATURE] = anchor
+            fold_predictions["actual_change_from_history"] = (
+                fold_predictions["actual_tch"] - anchor
+            )
+            fold_predictions["pred_change_from_history"] = (
+                fold_predictions["pred_tch"] - anchor
+            )
+        prediction_frames.append(fold_predictions)
+
+        if quantiles_enabled:
+            fold_quantile_models = fit_quantile_models(
+                X.loc[train_idx],
+                y_model.loc[train_idx],
+                model_type,
+                params,
+                categorical_mode,
+                sample_weight=fold_train_weight,
+            )
+            fold_quantile_predictions = predict_quantiles(
+                model,
+                model_type,
+                fold_quantile_models,
+                X.loc[validation_idx],
+                y_actual.loc[validation_idx],
+                metadata,
+                split="walk_forward",
+                target_mode=target_mode,
+            )
+            fold_quantile_predictions["validation_zafra"] = validation_zafra
+            quantile_prediction_frames.append(fold_quantile_predictions)
+
+    predictions = (
+        pd.concat(prediction_frames, ignore_index=True)
+        if prediction_frames
+        else pd.DataFrame()
+    )
+    quantile_predictions = (
+        pd.concat(quantile_prediction_frames, ignore_index=True)
+        if quantile_prediction_frames
+        else pd.DataFrame()
+    )
+    return pd.DataFrame(rows), predictions, quantile_predictions
 
 
 def main():
@@ -739,7 +1163,19 @@ def main():
         choices=["aggregated", "feature_table", "preaggregated", "sequential"],
     )
     parser.add_argument("--target", type=str, default=hyperparameter(hp_defaults, "target", "tch"))
+    parser.add_argument(
+        "--target-mode",
+        type=str,
+        default=hyperparameter(hp_defaults, "target-mode", "absolute"),
+        choices=sorted(TARGET_MODES),
+    )
     parser.add_argument("--n-trials", type=int, default=hyperparameter(hp_defaults, "n-trials", 50, int))
+    parser.add_argument(
+        "--search-profile",
+        type=str,
+        default=hyperparameter(hp_defaults, "search-profile", "default"),
+        choices=["default", "phase4_catboost"],
+    )
     parser.add_argument("--walk-forward", type=parse_bool, default=hyperparameter(hp_defaults, "walk-forward", False, parse_bool))
     parser.add_argument("--walk-forward-stability-penalty", type=float, default=hyperparameter(hp_defaults, "walk-forward-stability-penalty", 0.25, float))
     parser.add_argument(
@@ -749,6 +1185,37 @@ def main():
         choices=sorted(OBJECTIVE_MODES),
     )
     parser.add_argument("--aggregate-penalty", type=float, default=hyperparameter(hp_defaults, "aggregate-penalty", 1.0, float))
+    parser.add_argument(
+        "--high-yield-penalty",
+        type=float,
+        default=hyperparameter(hp_defaults, "high-yield-penalty", 0.0, float),
+    )
+    parser.add_argument(
+        "--worst-estrato-penalty",
+        type=float,
+        default=hyperparameter(hp_defaults, "worst-estrato-penalty", 0.0, float),
+    )
+    parser.add_argument(
+        "--weight-mode",
+        type=str,
+        default=hyperparameter(hp_defaults, "weight-mode", "snapshot"),
+        choices=sorted(WEIGHT_MODES),
+    )
+    parser.add_argument(
+        "--weight-max-multiplier",
+        type=float,
+        default=hyperparameter(hp_defaults, "weight-max-multiplier", 1.0, float),
+    )
+    parser.add_argument(
+        "--weight-density-bin-width",
+        type=float,
+        default=hyperparameter(hp_defaults, "weight-density-bin-width", 5.0, float),
+    )
+    parser.add_argument(
+        "--fixed-params-json",
+        type=str,
+        default=hyperparameter(hp_defaults, "fixed-params-json", ""),
+    )
     parser.add_argument("--light-features", type=parse_bool, default=hyperparameter(hp_defaults, "light-features", True, parse_bool))
     parser.add_argument("--one-hot-features", type=parse_bool, default=hyperparameter(hp_defaults, "one-hot-features", True, parse_bool))
     parser.add_argument(
@@ -758,6 +1225,7 @@ def main():
         choices=sorted(CATEGORICAL_MODES),
     )
     parser.add_argument("--quantiles", type=parse_bool, default=hyperparameter(hp_defaults, "quantiles", True, parse_bool))
+    parser.add_argument("--walk-forward-quantiles", type=parse_bool, default=hyperparameter(hp_defaults, "walk-forward-quantiles", False, parse_bool))
     parser.add_argument("--shap", type=parse_bool, default=hyperparameter(hp_defaults, "shap", True, parse_bool))
     parser.add_argument("--diagnostics", type=parse_bool, default=hyperparameter(hp_defaults, "diagnostics", True, parse_bool))
     parser.add_argument("--diagnostics-only", type=parse_bool, default=hyperparameter(hp_defaults, "diagnostics-only", False, parse_bool))
@@ -776,6 +1244,21 @@ def main():
     evaluation_zafras = parse_csv_list(args.evaluation_zafras)
     scoring_zafras = parse_csv_list(args.scoring_zafras)
     requested_excluded_features = parse_csv_list(args.exclude_features)
+    if args.weight_max_multiplier < 1.0:
+        raise ValueError("--weight-max-multiplier must be at least 1.0")
+    if args.weight_density_bin_width <= 0:
+        raise ValueError("--weight-density-bin-width must be positive")
+    if args.high_yield_penalty < 0 or args.worst_estrato_penalty < 0:
+        raise ValueError("Objective penalties must be non-negative")
+    if args.search_profile == "phase4_catboost" and args.model_type != "catboost":
+        raise ValueError("phase4_catboost search profile requires --model-type catboost")
+    fixed_params = (
+        json.loads(args.fixed_params_json)
+        if args.fixed_params_json.strip()
+        else {}
+    )
+    if fixed_params and not args.skip_optuna:
+        raise ValueError("--fixed-params-json requires --skip-optuna true")
     validate_zafra_configuration(train_zafras, evaluation_zafras, scoring_zafras)
 
     data_dir = os.environ.get("SM_CHANNEL_TRAIN", "/opt/ml/input/data/train")
@@ -813,6 +1296,54 @@ def main():
         target=args.target,
         light_features=args.light_features,
     )
+    if (
+        args.target_mode in {"residual_last_hist_tch", "direct_metric_tons"}
+        and RESIDUAL_ANCHOR_FEATURE in requested_excluded_features
+    ):
+        raise ValueError(
+            f"--exclude-features cannot remove {RESIDUAL_ANCHOR_FEATURE} "
+            f"when target_mode={args.target_mode}"
+        )
+    if args.target_mode in {"residual_last_hist_tch", "direct_metric_tons"}:
+        if RESIDUAL_ANCHOR_FEATURE not in X_raw.columns:
+            raise ValueError(
+                f"target_mode={args.target_mode} requires feature "
+                f"{RESIDUAL_ANCHOR_FEATURE}"
+            )
+        residual_eligible = pd.to_numeric(
+            X_raw[RESIDUAL_ANCHOR_FEATURE],
+            errors="coerce",
+        ).notna()
+        removed = int((~residual_eligible).sum())
+        if removed:
+            log(
+                f"Residual target eligibility removed {removed:,} labeled rows "
+                f"without {RESIDUAL_ANCHOR_FEATURE}"
+            )
+        X_raw = X_raw.loc[residual_eligible].copy()
+        y = y.loc[residual_eligible].copy()
+        metadata = metadata[
+            metadata["cod_cg_zafra"].isin(X_raw.index)
+        ].copy()
+    if args.target_mode == "direct_metric_tons":
+        area = (
+            metadata.set_index("cod_cg_zafra")["area"]
+            .reindex(X_raw.index)
+            .pipe(pd.to_numeric, errors="coerce")
+        )
+        eligible_area = area.notna() & area.gt(0)
+        removed = int((~eligible_area).sum())
+        if removed:
+            log(
+                f"Direct metric-tons eligibility removed {removed:,} rows "
+                "without positive area"
+            )
+        X_raw = X_raw.loc[eligible_area].copy()
+        y = y.loc[eligible_area].copy()
+        X_raw[DIRECT_AREA_FEATURE] = area.loc[eligible_area]
+        metadata = metadata[
+            metadata["cod_cg_zafra"].isin(X_raw.index)
+        ].copy()
     X_raw, excluded_features = exclude_feature_columns(
         X_raw,
         requested_excluded_features,
@@ -856,6 +1387,30 @@ def main():
                 "Excluded feature order differs between training and future scoring: "
                 f"training={excluded_features}, scoring={future_excluded_features}"
             )
+        if args.target_mode in {"residual_last_hist_tch", "direct_metric_tons"}:
+            missing_future_anchor = int(
+                pd.to_numeric(
+                    future_X_raw[RESIDUAL_ANCHOR_FEATURE],
+                    errors="coerce",
+                ).isna().sum()
+            )
+            if missing_future_anchor:
+                raise ValueError(
+                    f"Future scoring has {missing_future_anchor} rows without "
+                    f"{RESIDUAL_ANCHOR_FEATURE}"
+                )
+        if args.target_mode == "direct_metric_tons":
+            future_area = (
+                future_metadata.set_index("cod_cg_zafra")["area"]
+                .reindex(future_X_raw.index)
+                .pipe(pd.to_numeric, errors="coerce")
+            )
+            if future_area.isna().any() or (future_area <= 0).any():
+                raise ValueError(
+                    "Future scoring has rows without positive area for "
+                    "target_mode=direct_metric_tons"
+                )
+            future_X_raw[DIRECT_AREA_FEATURE] = future_area
         log(
             f"Built future scoring matrix: rows={len(future_X_raw):,}, "
             f"features={future_X_raw.shape[1]:,}"
@@ -897,6 +1452,7 @@ def main():
                     "dataset_type": args.dataset_type,
                     "model_type": args.model_type,
                     "target": args.target,
+                    "target_mode": args.target_mode,
                     "input_rows": int(len(source_df)),
                     **training_filter_info,
                     "matrix_rows": int(len(X_raw)),
@@ -923,6 +1479,13 @@ def main():
                     "objective_mode": args.objective_mode,
                     "resolved_objective_mode": resolved_objective_mode,
                     "aggregate_penalty": float(args.aggregate_penalty),
+                    "high_yield_penalty": float(args.high_yield_penalty),
+                    "worst_estrato_penalty": float(args.worst_estrato_penalty),
+                    "weight_mode": args.weight_mode,
+                    "weight_max_multiplier": float(args.weight_max_multiplier),
+                    "weight_density_bin_width": float(args.weight_density_bin_width),
+                    "fixed_params": fixed_params,
+                    "search_profile": args.search_profile,
                     "configured_train_zafras": train_zafras,
                     "configured_evaluation_zafras": evaluation_zafras,
                     "configured_scoring_zafras": scoring_zafras,
@@ -950,12 +1513,16 @@ def main():
         mode=categorical_mode,
     )
     X = prepare_features_for_model(X, args.model_type, categorical_mode)
+    y_model = model_target(y, X, args.target_mode)
     log(f"Built encoded feature matrix: rows={len(X):,}, features={X.shape[1]:,}")
     if categorical_mode == CATEGORICAL_MODE_NATIVE:
         log(f"Using native categorical columns: {categorical_feature_columns(X)}")
 
-    X_train, y_train = X.loc[train_idx], y.loc[train_idx]
-    X_evaluation, y_evaluation = X.loc[evaluation_idx], y.loc[evaluation_idx]
+    X_train = X.loc[train_idx]
+    y_train = y.loc[train_idx]
+    y_train_model = y_model.loc[train_idx]
+    X_evaluation = X.loc[evaluation_idx]
+    y_evaluation = y.loc[evaluation_idx]
 
     log(
         "Dataset: "
@@ -971,8 +1538,9 @@ def main():
         log("Skipping feature diagnostics")
 
     if args.skip_optuna:
-        log(f"Skipping Optuna; using default parameters for model_type={args.model_type}")
-        best_params = {}
+        best_params = fixed_params
+        source = "fixed promoted parameters" if fixed_params else "default parameters"
+        log(f"Skipping Optuna; using {source} for model_type={args.model_type}")
         optuna_trials = pd.DataFrame()
     elif args.walk_forward:
         if resolved_objective_mode == "aggregate_tch_sum":
@@ -980,18 +1548,28 @@ def main():
                 "score=mean_rmse+"
                 f"{args.aggregate_penalty}*mean_abs_raw_tch_sum_pct_diff"
             )
+        elif resolved_objective_mode == "aggregate_metric_tons":
+            objective_description = (
+                "score=mean_rmse+"
+                f"{args.aggregate_penalty}*mean_abs_metric_tons_pct_diff+"
+                f"{args.high_yield_penalty}*mean_high_yield_abs_bias+"
+                f"{args.worst_estrato_penalty}*mean_worst_estrato_abs_pct_error"
+            )
         else:
             objective_description = f"score=mean_r2-{args.walk_forward_stability_penalty}*std_r2"
         log(
             "Starting Optuna with walk-forward objective: "
-            f"model_type={args.model_type}, n_trials={args.n_trials}, {objective_description}"
+            f"model_type={args.model_type}, search_profile={args.search_profile}, "
+            f"n_trials={args.n_trials}, {objective_description}"
         )
         best_params, study = fit_with_optuna(
             X_train,
+            y_train_model,
             y_train,
             X_evaluation,
             y_evaluation,
             X,
+            y_model,
             y,
             metadata,
             model_type=args.model_type,
@@ -1002,20 +1580,31 @@ def main():
             objective_mode=args.objective_mode,
             aggregate_penalty=args.aggregate_penalty,
             walk_forward_zafras=train_zafras,
+            target_mode=args.target_mode,
+            weight_mode=args.weight_mode,
+            weight_max_multiplier=args.weight_max_multiplier,
+            weight_density_bin_width=args.weight_density_bin_width,
+            high_yield_penalty=args.high_yield_penalty,
+            worst_estrato_penalty=args.worst_estrato_penalty,
+            search_profile=args.search_profile,
         )
         optuna_trials = study.trials_dataframe()
     else:
         if resolved_objective_mode == "aggregate_tch_sum":
             objective_description = f"score=evaluation_rmse+{args.aggregate_penalty}*abs_raw_tch_sum_pct_diff"
+        elif resolved_objective_mode == "aggregate_metric_tons":
+            objective_description = f"score=evaluation_rmse+{args.aggregate_penalty}*abs_metric_tons_pct_diff"
         else:
             objective_description = "score=evaluation_rmse"
         log(f"Starting Optuna: model_type={args.model_type}, n_trials={args.n_trials}, {objective_description}")
         best_params, study = fit_with_optuna(
             X_train,
+            y_train_model,
             y_train,
             X_evaluation,
             y_evaluation,
             X,
+            y_model,
             y,
             metadata,
             model_type=args.model_type,
@@ -1026,18 +1615,48 @@ def main():
             objective_mode=args.objective_mode,
             aggregate_penalty=args.aggregate_penalty,
             walk_forward_zafras=train_zafras,
+            target_mode=args.target_mode,
+            weight_mode=args.weight_mode,
+            weight_max_multiplier=args.weight_max_multiplier,
+            weight_density_bin_width=args.weight_density_bin_width,
+            high_yield_penalty=args.high_yield_penalty,
+            worst_estrato_penalty=args.worst_estrato_penalty,
+            search_profile=args.search_profile,
         )
         optuna_trials = study.trials_dataframe()
     log(f"Best params: {best_params}")
 
     log("Training final model on train split")
     model = build_estimator(args.model_type, best_params)
-    train_sample_weight = sample_weights_for_index(metadata, train_idx)
+    train_sample_weight = training_weights_for_index(
+        metadata,
+        y,
+        X,
+        train_idx,
+        train_idx,
+        mode=args.weight_mode,
+        max_multiplier=args.weight_max_multiplier,
+        density_bin_width=args.weight_density_bin_width,
+    )
+    train_weight_diagnostics = weight_diagnostics(
+        metadata,
+        y,
+        X,
+        train_idx,
+        mode=args.weight_mode,
+        max_multiplier=args.weight_max_multiplier,
+        density_bin_width=args.weight_density_bin_width,
+    )
+    log(
+        "Training weights: "
+        f"mode={args.weight_mode}, cap={args.weight_max_multiplier}, "
+        f"summary={dict(zip(train_weight_diagnostics['metric'], train_weight_diagnostics['value']))}"
+    )
     fit_model(
         model,
         args.model_type,
         X_train,
-        y_train,
+        y_train_model,
         categorical_mode,
         sample_weight=train_sample_weight,
     )
@@ -1051,7 +1670,7 @@ def main():
             log(f"Training {args.model_type} native quantile models: p10, p50, p90")
             quantile_models = fit_quantile_models(
                 X_train,
-                y_train,
+                y_train_model,
                 args.model_type,
                 best_params,
                 categorical_mode,
@@ -1061,7 +1680,7 @@ def main():
             log(f"Training sklearn quantile auxiliary models for {args.model_type}: p10, p50, p90")
             quantile_models = fit_quantile_models(
                 X_train,
-                y_train,
+                y_train_model,
                 args.model_type,
                 best_params,
                 categorical_mode,
@@ -1084,6 +1703,7 @@ def main():
             y.loc[split_idx],
             metadata,
             split=split,
+            target_mode=args.target_mode,
         )
         metrics_by_split[split] = split_metrics
         zafra_frames.append(split_zafra)
@@ -1098,6 +1718,7 @@ def main():
                     y.loc[split_idx],
                     metadata,
                     split=split,
+                    target_mode=args.target_mode,
                 )
             )
         log(f"{split} metrics: {split_metrics}")
@@ -1108,6 +1729,7 @@ def main():
     metrics_by_zafra_evaluation = metrics_by_zafra[metrics_by_zafra["split"] == "evaluation"].copy()
     metrics_by_lot_error = lot_error_metrics(predictions_by_lot)
     metrics_by_snapshot_day = snapshot_day_metrics(predictions_by_lot)
+    metrics_by_estrato = estrato_metrics(predictions_by_lot)
     metrics_by_tch_range = tch_range_metrics(predictions_by_lot)
     metrics_tail_error = tail_error_report(predictions_by_lot)
     for row in metrics_by_lot_error.to_dict(orient="records"):
@@ -1151,15 +1773,23 @@ def main():
     log(f"Aggregate zafra metrics: {metrics_by_zafra_aggregate.to_dict(orient='records')}")
 
     walk_forward_metrics = pd.DataFrame()
+    walk_forward_predictions = pd.DataFrame()
+    walk_forward_quantile_predictions = pd.DataFrame()
     if args.walk_forward:
-        walk_forward_metrics = run_walk_forward(
+        walk_forward_metrics, walk_forward_predictions, walk_forward_quantile_predictions = run_walk_forward(
             X,
+            y_model,
             y,
             metadata,
             args.model_type,
             best_params,
             categorical_mode,
             train_zafras,
+            target_mode=args.target_mode,
+            weight_mode=args.weight_mode,
+            weight_max_multiplier=args.weight_max_multiplier,
+            weight_density_bin_width=args.weight_density_bin_width,
+            quantiles_enabled=bool(args.walk_forward_quantiles),
         )
         log(f"Walk-forward metrics: {walk_forward_metrics.to_dict(orient='records')}")
 
@@ -1171,6 +1801,7 @@ def main():
 
     future_predictions = pd.DataFrame()
     future_summary = pd.DataFrame()
+    future_estrato_summary = pd.DataFrame()
     if not future_X_raw.empty:
         future_X = transform_categorical_features(future_X_raw, categorical_encoding_state)
         future_X = prepare_features_for_model(
@@ -1192,9 +1823,13 @@ def main():
             quantile_models,
             future_X,
             future_metadata,
+            target_mode=args.target_mode,
         )
         future_summary = summarize_future_scoring(future_predictions)
+        future_estrato_summary = future_scoring_estrato_metrics(future_predictions)
         log(f"Future scoring summary: {future_summary.to_dict(orient='records')}")
+        if not future_estrato_summary.empty:
+            log(f"Future scoring by estrato: {future_estrato_summary.to_dict(orient='records')}")
 
     log("Saving artifacts")
     joblib.dump(model, os.path.join(model_dir, "model.joblib"))
@@ -1212,6 +1847,8 @@ def main():
             os.path.join(output_dir, "metrics_by_snapshot_day.csv"),
             index=False,
         )
+    if not metrics_by_estrato.empty:
+        metrics_by_estrato.to_csv(os.path.join(output_dir, "metrics_by_estrato.csv"), index=False)
     metrics_by_tch_range.to_csv(os.path.join(output_dir, "metrics_by_tch_range.csv"), index=False)
     metrics_tail_error.to_csv(os.path.join(output_dir, "tail_error_report.csv"), index=False)
     metrics_by_zafra.to_csv(os.path.join(output_dir, "metrics_by_zafra.csv"), index=False)
@@ -1225,12 +1862,31 @@ def main():
         future_predictions.to_csv(os.path.join(output_dir, "future_scoring_predictions.csv"), index=False)
     if not future_summary.empty:
         future_summary.to_csv(os.path.join(output_dir, "future_scoring_by_zafra.csv"), index=False)
+    if not future_estrato_summary.empty:
+        future_estrato_summary.to_csv(
+            os.path.join(output_dir, "future_scoring_by_estrato.csv"),
+            index=False,
+        )
     if not excluded_scoring_df.empty:
         excluded_scoring_df.to_csv(os.path.join(output_dir, "future_scoring_excluded.csv"), index=False)
     optuna_trials.to_csv(os.path.join(output_dir, "optuna_trials.csv"), index=False)
+    train_weight_diagnostics.to_csv(
+        os.path.join(output_dir, "training_weight_diagnostics.csv"),
+        index=False,
+    )
     if not walk_forward_metrics.empty:
         walk_forward_metrics.to_csv(os.path.join(output_dir, "walk_forward_metrics.csv"), index=False)
+    if not walk_forward_predictions.empty:
+        walk_forward_predictions.to_csv(
+            os.path.join(output_dir, "walk_forward_predictions.csv"),
+            index=False,
+        )
 
+    if not walk_forward_quantile_predictions.empty:
+        walk_forward_quantile_predictions.to_csv(
+            os.path.join(output_dir, "walk_forward_quantile_predictions.csv"),
+            index=False,
+        )
     with open(os.path.join(output_dir, "metrics.json"), "w") as f:
         json.dump(metrics_by_split, f, indent=2)
     with open(os.path.join(output_dir, "best_params.json"), "w") as f:
@@ -1245,6 +1901,7 @@ def main():
                 "dataset_type": args.dataset_type,
                 "model_type": args.model_type,
                 "target": args.target,
+                "target_mode": args.target_mode,
                 "input_rows": int(len(source_df)),
                 **training_filter_info,
                 "matrix_rows": int(len(X)),
@@ -1273,12 +1930,20 @@ def main():
                 "categorical_columns": categorical_encoding_state.categorical_cols,
                 "dropped_categorical_columns": categorical_encoding_state.drop_cols,
                 "quantiles": bool(quantiles_enabled),
+                "walk_forward_quantiles": bool(args.walk_forward_quantiles),
                 "quantile_alphas": list(QUANTILE_ALPHAS),
                 "walk_forward": bool(args.walk_forward),
                 "walk_forward_stability_penalty": float(args.walk_forward_stability_penalty),
                 "objective_mode": args.objective_mode,
                 "resolved_objective_mode": resolved_objective_mode,
                 "aggregate_penalty": float(args.aggregate_penalty),
+                "high_yield_penalty": float(args.high_yield_penalty),
+                "worst_estrato_penalty": float(args.worst_estrato_penalty),
+                "weight_mode": args.weight_mode,
+                "weight_max_multiplier": float(args.weight_max_multiplier),
+                "weight_density_bin_width": float(args.weight_density_bin_width),
+                "fixed_params": fixed_params,
+                "search_profile": args.search_profile,
                 "configured_train_zafras": train_zafras,
                 "configured_evaluation_zafras": evaluation_zafras,
                 "configured_scoring_zafras": scoring_zafras,

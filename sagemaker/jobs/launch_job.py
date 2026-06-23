@@ -18,15 +18,18 @@ from config import BUCKET, INSTANCE_TYPE, REGION, ROLE_ARN
 
 def launch(
     dataset: str,
-    model_type: str = "xgboost",
-    dataset_type: str = "aggregated",
+    model_type: str = "catboost",
+    dataset_type: str = "feature_table",
     target: str = "tch",
+    target_mode: str = "residual_last_hist_tch",
     n_trials: int = 50,
     partitioned: bool = False,
     walk_forward: bool = False,
     walk_forward_stability_penalty: float = 0.25,
-    objective_mode: str = "auto",
+    objective_mode: str = "aggregate_metric_tons",
     aggregate_penalty: float = 1.0,
+    weight_mode: str = "snapshot_historical_tch",
+    weight_max_multiplier: float = 1.25,
     light_features: bool = True,
     one_hot_features: bool = True,
     categorical_mode: str = "controlled",
@@ -62,11 +65,14 @@ def launch(
         "model-type": model_type,
         "dataset-type": dataset_type,
         "target": target,
+        "target-mode": target_mode,
         "n-trials": n_trials,
         "walk-forward": str(walk_forward).lower(),
         "walk-forward-stability-penalty": walk_forward_stability_penalty,
         "objective-mode": objective_mode,
         "aggregate-penalty": aggregate_penalty,
+        "weight-mode": weight_mode,
+        "weight-max-multiplier": weight_max_multiplier,
         "light-features": str(light_features).lower(),
         "one-hot-features": str(one_hot_features).lower(),
         "categorical-mode": categorical_mode,
@@ -121,15 +127,26 @@ def launch(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", help="Dataset name matching a parquet in the configured S3 datasets prefix")
-    parser.add_argument("--model-type", default="xgboost", choices=["xgboost", "lightgbm", "catboost", "random_forest", "ridge"])
-    parser.add_argument("--dataset-type", default="aggregated", choices=["aggregated", "feature_table", "preaggregated", "sequential"])
+    parser.add_argument("--model-type", default="catboost", choices=["xgboost", "lightgbm", "catboost", "random_forest", "ridge"])
+    parser.add_argument("--dataset-type", default="feature_table", choices=["aggregated", "feature_table", "preaggregated", "sequential"])
     parser.add_argument("--target", default="tch")
+    parser.add_argument("--target-mode", default="residual_last_hist_tch", choices=["absolute", "residual_last_hist_tch", "direct_metric_tons"])
     parser.add_argument("--n-trials", type=int, default=50)
     parser.add_argument("--partitioned", action="store_true", help="Read dataset from s3://bucket/datasets/{dataset}/ parquet parts")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--walk-forward-stability-penalty", type=float, default=0.25)
-    parser.add_argument("--objective-mode", default="auto", choices=["auto", "lot_rmse", "walk_forward_r2", "aggregate_tch_sum"])
-    parser.add_argument("--aggregate-penalty", type=float, default=1.0, help="RMSE-equivalent penalty per raw zafra TCH-sum percentage-point error")
+    parser.add_argument(
+        "--objective-mode",
+        default="aggregate_metric_tons",
+        choices=["auto", "lot_rmse", "walk_forward_r2", "aggregate_tch_sum", "aggregate_metric_tons"],
+    )
+    parser.add_argument("--aggregate-penalty", type=float, default=1.0, help="RMSE-equivalent penalty per aggregate percentage-point error")
+    parser.add_argument(
+        "--weight-mode",
+        default="snapshot_historical_tch",
+        choices=["snapshot", "snapshot_sqrt_area", "snapshot_density", "snapshot_historical_tch", "snapshot_area_density"],
+    )
+    parser.add_argument("--weight-max-multiplier", type=float, default=1.25)
     parser.add_argument("--no-light-features", action="store_true", help="Disable light pandas-derived features for feature-table datasets")
     parser.add_argument("--categorical-mode", default="controlled", choices=["controlled", "native", "none"])
     parser.add_argument("--no-dummies", action="store_true", help="Keep categorical columns raw for CatBoost native categorical handling")
@@ -153,12 +170,15 @@ if __name__ == "__main__":
         args.model_type,
         args.dataset_type,
         args.target,
+        args.target_mode,
         args.n_trials,
         args.partitioned,
         args.walk_forward,
         args.walk_forward_stability_penalty,
         args.objective_mode,
         args.aggregate_penalty,
+        args.weight_mode,
+        args.weight_max_multiplier,
         not args.no_light_features,
         not args.no_dummies,
         "native" if args.no_dummies else args.categorical_mode,
