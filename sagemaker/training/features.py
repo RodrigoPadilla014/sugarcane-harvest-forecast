@@ -83,6 +83,9 @@ FEATURE_TABLE_METADATA_COLS = [
     "climate_lote_match_method",
     "last_hist_zafra_norm",
     "last_hist_fecha_cierre_real",
+    "realized_harvest_percentile",
+    "realized_harvest_third",
+    "enso_prob_latest_issue_date",
 ]
 
 STATIC_COLS = [
@@ -102,6 +105,9 @@ STATIC_COLS = [
     "last_hist_ingenio",
     "enso_phase_snapshot",
     "enso_phase_precycle",
+    "enso_prob_most_likely_class",
+    "expected_harvest_third_lagged",
+    "spatial_fallback_strategy",
 ]
 
 METADATA_STATIC_COLS = ["cod_cg", TIME_COL, "area"]
@@ -159,6 +165,8 @@ EXCLUDED_FEATURE_COLS = {
     "cierre",
     "cierre_date",
     "prod_mes_de_cosecha",
+    "realized_harvest_percentile",
+    "realized_harvest_third",
     # Productividad spectral fields are intentionally not selected in the raw
     # query; keep these names blocked in case they are added later.
     "prod_ndvi",

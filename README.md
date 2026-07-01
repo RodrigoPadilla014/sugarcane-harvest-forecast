@@ -3,8 +3,9 @@
 Production-oriented pipeline for estimating sugarcane TCH and aggregate cane
 volume for a future productive zafra.
 
-The current model version is V10. It uses a residual target anchored on the
-latest historical lot productivity:
+The current official model is V10. V13 is retained as a challenger line for
+side-by-side monitoring against real harvest outcomes. Both use a residual
+target anchored on the latest historical lot productivity:
 
 ```text
 delta_tch = actual_tch - last_hist_tch
@@ -15,20 +16,20 @@ This design keeps the model tied to each lot's known productivity history while
 allowing agronomic, climate, optical, radar, ENSO, variety, cut, soil, and
 snapshot-age features to explain expected movement from history.
 
-## Repository layout
+## Repository Layout
 
 ```text
 ec2/         EC2 runner for reproducible training and artifact upload
-queries/    Active production SQL dataset definition
+queries/    Active SQL dataset definitions and diagnostics
 sagemaker/  Dataset upload, Docker image, model training, metrics, diagnostics
 ```
 
 Local-only folders such as `credentials/`, `.tmp/`, dashboards, archived
 experiments, and generated artifacts are ignored by Git.
 
-## Active dataset
+## Active Datasets
 
-Dataset key:
+Official production dataset:
 
 ```text
 tch_features_v10_productivity_history_snapshots
@@ -39,6 +40,19 @@ Committed SQL:
 ```text
 queries/active/v10/dataset/tch_v10_productivity_snapshot_spine.sql
 queries/active/v10/dataset/tch_features_v10_productivity_history_snapshots.sql
+```
+
+Challenger dataset:
+
+```text
+tch_features_v13_spatial_enso_harvest
+```
+
+Committed SQL:
+
+```text
+queries/active/v13/dataset/tch_features_v13_spatial_enso_harvest.sql
+queries/active/v13/dataset/tch_v13_diagnostics.sql
 ```
 
 Upload the dataset as partitioned parquet:
@@ -55,9 +69,9 @@ The SQL is snapshot-aware. Historical lot-cycles are scored at fixed ages
 includes lots that are old enough to have a valid snapshot. Pending lots remain
 outside the scored population until they become eligible.
 
-## Model design
+## Model Design
 
-Final production candidate:
+Official V10 configuration:
 
 ```text
 Model:        CatBoost
@@ -74,6 +88,11 @@ relative to the latest historical TCH. Moderate historical-TCH weighting is
 used to improve behavior in the upper productivity range without introducing a
 hard high-yield rule.
 
+V13 keeps the V10 base population and training setup, then adds leakage-checked
+spatial, ENSO probability, and lagged harvest-timing features. It is not
+promoted by default; it should be compared against V10 as new harvest data
+arrives.
+
 The pipeline evaluates:
 
 - row-level RMSE and MAE;
@@ -83,7 +102,7 @@ The pipeline evaluates:
 - high-productivity behavior;
 - uncertainty calibration and practical prediction ranges.
 
-## Training and scoring
+## Training And Scoring
 
 The EC2 runner executes one explicit stage per command:
 
@@ -93,11 +112,10 @@ baseline
 optuna
 ```
 
-The final V10 model is run through the baseline stage with the residual target
-and selected weighting configuration. Optuna and additional challengers were
-used during model development, but the production path should stay on the V10
-CatBoost residual configuration unless a future validation cycle promotes a new
-model.
+The official V10 model is run through the baseline stage with the residual
+target and selected weighting configuration. V13 should use the same baseline
+settings for apples-to-apples monitoring unless a deliberate experiment changes
+the comparison protocol.
 
 Dry run:
 
@@ -135,7 +153,7 @@ run_manifest.json
 run_status.json
 ```
 
-## Results summary
+## Results Summary
 
 V10 improved the production workflow in three ways:
 
@@ -150,6 +168,11 @@ behavior than the earlier absolute-TCH design. Calibration experiments did not
 justify replacing the uncalibrated central forecast, so the central forecast is
 kept as the model output and uncertainty is communicated separately.
 
+V13 is a credible challenger because it improved comparable held-out validation
+metrics versus a fresh V10 rerun while raising the 2026_2027 forecast. The main
+caveat is high-yield tail compression: lots above 130 TCH remain underpredicted
+and should be monitored before any promotion decision.
+
 For uncertainty:
 
 - native P10/P90 intervals are retained as model diagnostics;
@@ -158,7 +181,7 @@ For uncertainty:
 - aggregate uncertainty is reported separately from lot-level uncertainty;
 - extreme low/high productivity lots should be treated with extra caution.
 
-## Docker image
+## Docker Image
 
 Build and push the training image from the repository root:
 

@@ -24,6 +24,7 @@ load_dotenv(ROOT / "credentials" / ".env")
 BUCKET = "ndvi-extraction"
 QUERIES_DIR = ROOT / "queries"
 QUERY_SEARCH_DIRS = [
+    QUERIES_DIR / "active" / "v13" / "dataset",
     QUERIES_DIR / "active" / "v10" / "dataset",
     QUERIES_DIR,
 ]
